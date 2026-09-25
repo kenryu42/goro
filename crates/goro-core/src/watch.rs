@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use notify::{RecursiveMode, Watcher as _};
+use notify::event::ModifyKind;
+use notify::{EventKind, RecursiveMode, Watcher as _};
 
 use crate::review::Dirty;
 
@@ -47,13 +48,13 @@ pub fn watch(
         .map_err(|e| WatchError::Repo(e.to_string()))?;
     let thread_safe = repo.into_sync();
 
-    let (tx, rx) = mpsc::channel::<PathBuf>();
+    let (tx, rx) = mpsc::channel::<(PathBuf, EventKind)>();
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
         if let Ok(event) = event
             && is_change(&event.kind)
         {
             for path in event.paths {
-                let _ = tx.send(path);
+                let _ = tx.send((path, event.kind));
             }
         }
     })?;
@@ -94,7 +95,7 @@ fn classify(
     repo: &gix::Repository,
     root: &Path,
     git_dir: &Path,
-    paths: Vec<PathBuf>,
+    paths: Vec<(PathBuf, EventKind)>,
 ) -> Option<Dirty> {
     let mut git_state_changed = false;
     let mut dirty = HashSet::new();
@@ -107,7 +108,7 @@ fn classify(
         )
         .ok()
     });
-    for path in paths {
+    for (path, kind) in paths {
         if let Ok(rela) = path.strip_prefix(git_dir) {
             if is_git_state(rela) {
                 git_state_changed = true;
@@ -126,6 +127,14 @@ fn classify(
             continue;
         }
         if path.is_dir() {
+            // Windows also reports a directory as modified when an entry inside it
+            // changes; that entry has its own event.
+            if matches!(
+                kind,
+                EventKind::Modify(ModifyKind::Any | ModifyKind::Data(_))
+            ) {
+                continue;
+            }
             // A directory appeared, vanished or was renamed: anything below may differ.
             return Some(Dirty::All);
         }
