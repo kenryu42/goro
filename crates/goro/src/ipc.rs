@@ -7,7 +7,6 @@
 //! - `wait`: open the repository and hold the connection until the user submits a
 //!   review; answered with `review` and the markdown, or `cancelled`.
 
-use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -167,6 +166,7 @@ fn encode_path(path: &Path) -> Vec<u8> {
 
 #[cfg(unix)]
 fn decode_path(bytes: &[u8]) -> PathBuf {
+    use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
     PathBuf::from(OsString::from_vec(bytes.to_vec()))
 }
