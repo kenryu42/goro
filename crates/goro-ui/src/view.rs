@@ -1444,7 +1444,9 @@ impl GoroView {
                     startup.t0.elapsed().as_secs_f64() * 1000.0
                 );
                 startup.mark("quitting");
-                cx.quit();
+                // As a task, so it runs once the event loop is live: the first frame can be
+                // drawn before the loop starts, and Linux ignores a stop requested before.
+                cx.spawn(async move |cx| cx.update(|cx| cx.quit())).detach();
             }
         });
     }

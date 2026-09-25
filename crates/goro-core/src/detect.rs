@@ -199,6 +199,16 @@ mod tests {
     use super::*;
     use std::time::{Duration, UNIX_EPOCH};
 
+    /// A canonical path without Windows' `\\?\` verbatim prefix, which git discovery
+    /// doesn't use.
+    fn canonical(path: &Path) -> std::path::PathBuf {
+        let path = path.canonicalize().unwrap();
+        match path.to_str().and_then(|p| p.strip_prefix(r"\\?\")) {
+            Some(plain) => std::path::PathBuf::from(plain),
+            None => path,
+        }
+    }
+
     fn touch(path: &Path, contents: &str, secs: u64) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, contents).unwrap();
@@ -220,7 +230,7 @@ mod tests {
     #[test]
     fn newest_agent_session_wins_across_agents() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
+        let root = canonical(tmp.path());
         let (claude_repo, codex_repo) = (root.join("work/claude"), root.join("work/codex"));
         init_repo(&claude_repo);
         init_repo(&codex_repo);
@@ -271,7 +281,7 @@ mod tests {
     #[test]
     fn falls_back_to_recent_repositories_and_skips_non_repos() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
+        let root = canonical(tmp.path());
         let repo = root.join("repo");
         init_repo(&repo);
         let logs = AgentLogs {
@@ -304,7 +314,7 @@ mod tests {
     #[test]
     fn a_newer_hook_record_beats_older_session_logs() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
+        let root = canonical(tmp.path());
         let (logged, hooked) = (root.join("logged"), root.join("hooked"));
         init_repo(&logged);
         init_repo(&hooked);

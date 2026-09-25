@@ -763,6 +763,8 @@ fn split_view_and_image_diffs() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     git(&root, &["init", "-q"]);
+    git(&root, &["config", "user.name", "Goro Test"]);
+    git(&root, &["config", "user.email", "goro@example.invalid"]);
     write(&root, "src/words.rs", RUST_BEFORE);
     write(&root, "icon.png", png(32, [200, 60, 60]));
     git(&root, &["add", "-A"]);
