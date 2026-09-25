@@ -69,7 +69,7 @@ jobs:
           [ "$RUNNER_OS" = Windows ] && goro=target/release/goro.exe
           run=""
           [ "$RUNNER_OS" = Linux ] && run="xvfb-run -a"
-          $run python3 scripts/bench/startup.py "$goro" "$RUNNER_TEMP/go" --budget-ms 300
+          GORO_TRACE_STARTUP=1 $run python3 scripts/bench/startup.py "$goro" "$RUNNER_TEMP/go" --budget-ms 300
       - name: Frame budget (p99 ≤ 16 ms, 50k-line changeset)
         shell: bash
         run: |

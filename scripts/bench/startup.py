@@ -23,12 +23,18 @@ def main() -> int:
 
     times = []
     for run in range(args.runs + 1):
-        out = subprocess.run(
-            [args.goro, "--bench-exit-after-first-paint", args.repo],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
+        try:
+            out = subprocess.run(
+                [args.goro, "--bench-exit-after-first-paint", args.repo],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except subprocess.TimeoutExpired as err:
+            print(f"run {run} timed out after 60 s; output so far:")
+            print((err.stdout or b"").decode(errors="replace") if isinstance(err.stdout, bytes) else (err.stdout or ""))
+            print((err.stderr or b"").decode(errors="replace") if isinstance(err.stderr, bytes) else (err.stderr or ""))
+            return 1
         line = next((l for l in out.stdout.splitlines() if l.startswith("first_paint_ms=")), None)
         if out.returncode != 0 or line is None:
             print(f"run {run} failed (exit {out.returncode}):\n{out.stdout}{out.stderr}")
