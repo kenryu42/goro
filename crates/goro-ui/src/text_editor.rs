@@ -1,4 +1,5 @@
-//! The commit message editor: multi-line plain text with selection, clipboard, and IME.
+//! A plain-text editor with selection, clipboard, and IME: the commit message box
+//! (multi-line) and the switcher's filter (single-line).
 //!
 //! Adapted from GPUI's `examples/input.rs` (Apache-2.0), extended to multiple lines. The
 //! editing model lives in [`TextBuffer`]; this module only lays out, paints, and routes
@@ -17,7 +18,7 @@ use gpui_kit::{
 use crate::text_buffer::TextBuffer;
 
 actions!(
-    commit_editor,
+    text_editor,
     [
         Backspace,
         Delete,
@@ -41,7 +42,7 @@ actions!(
     ]
 );
 
-pub const CONTEXT: &str = "CommitEditor";
+pub const CONTEXT: &str = "TextEditor";
 const MIN_LINES: usize = 3;
 
 pub fn bind_keys(cx: &mut App) {
@@ -85,11 +86,13 @@ pub struct EditorColors {
     pub selection: Hsla,
 }
 
-pub struct CommitEditor {
+pub struct TextEditor {
     focus_handle: FocusHandle,
     buffer: TextBuffer,
     placeholder: SharedString,
     colors: Option<EditorColors>,
+    /// Enter doesn't insert a newline; it propagates as [`Newline`] for the owner.
+    single_line: bool,
     scroll: ScrollHandle,
     /// Per line: its byte offset in the text, and its shaped layout from the last paint.
     layouts: Vec<(usize, ShapedLine)>,
@@ -98,19 +101,25 @@ pub struct CommitEditor {
     is_selecting: bool,
 }
 
-impl CommitEditor {
+impl TextEditor {
     pub fn new(placeholder: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
             buffer: TextBuffer::default(),
             placeholder: placeholder.into(),
             colors: None,
+            single_line: false,
             scroll: ScrollHandle::new(),
             layouts: Vec::new(),
             bounds: None,
             line_height: px(18.0),
             is_selecting: false,
         }
+    }
+
+    pub fn single_line(mut self) -> Self {
+        self.single_line = true;
+        self
     }
 
     pub fn text(&self) -> &str {
@@ -144,9 +153,15 @@ impl CommitEditor {
         self.edit(cx, |b| b.right(false));
     }
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+        if self.single_line {
+            return cx.propagate();
+        }
         self.edit(cx, |b| b.up(false));
     }
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
+        if self.single_line {
+            return cx.propagate();
+        }
         self.edit(cx, |b| b.down(false));
     }
     fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
@@ -177,12 +192,21 @@ impl CommitEditor {
         self.edit(cx, |b| b.line_end(true));
     }
     fn newline(&mut self, _: &Newline, _: &mut Window, cx: &mut Context<Self>) {
-        self.edit(cx, |b| b.insert("\n"));
+        if self.single_line {
+            cx.propagate();
+        } else {
+            self.edit(cx, |b| b.insert("\n"));
+        }
     }
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.edit(cx, |b| b.insert(&text.replace("\r\n", "\n")));
+            let text = if self.single_line {
+                text.replace(['\r', '\n'], " ")
+            } else {
+                text.replace("\r\n", "\n")
+            };
+            self.edit(cx, |b| b.insert(&text));
         }
     }
 
@@ -255,7 +279,7 @@ impl CommitEditor {
     }
 }
 
-impl EntityInputHandler for CommitEditor {
+impl EntityInputHandler for TextEditor {
     fn text_for_range(
         &mut self,
         range_utf16: Range<usize>,
@@ -375,13 +399,13 @@ impl EntityInputHandler for CommitEditor {
     }
 }
 
-impl Focusable for CommitEditor {
+impl Focusable for TextEditor {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
 }
 
-impl Render for CommitEditor {
+impl Render for TextEditor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("commit-editor")
@@ -413,7 +437,8 @@ impl Render for CommitEditor {
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .overflow_y_scroll()
             .track_scroll(&self.scroll)
-            .size_full()
+            .w_full()
+            .when(!self.single_line, |el| el.h_full())
             .child(EditorElement {
                 editor: cx.entity(),
             })
@@ -421,7 +446,7 @@ impl Render for CommitEditor {
 }
 
 struct EditorElement {
-    editor: Entity<CommitEditor>,
+    editor: Entity<TextEditor>,
 }
 
 struct Prepaint {
@@ -458,7 +483,9 @@ impl Element for EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, ()) {
-        let lines = self.editor.read(cx).buffer.lines().len().max(MIN_LINES);
+        let editor = self.editor.read(cx);
+        let min_lines = if editor.single_line { 1 } else { MIN_LINES };
+        let lines = editor.buffer.lines().len().max(min_lines);
         let mut style = Style::default();
         style.size.width = relative(1.).into();
         style.size.height = (window.line_height() * lines as f32).into();

@@ -10,3 +10,4 @@ goro-core.workspace = true
 goro-ui.workspace = true
 clap.workspace = true
 futures.workspace = true
+interprocess.workspace = true

@@ -3,9 +3,11 @@
 A native, instant-open review app for agent-written code changes. See [PRD.md](PRD.md)
 and [ARCHITECTURE.md](ARCHITECTURE.md).
 
-Status: M1. `goro [path]` opens a file tree and a syntax-highlighted diff of the
-working tree (staged, unstaged, untracked). Stage, unstage and discard whole files, hunks
-or selected lines; undo any of them; write the commit in the same window.
+Status: M2. `goro [path]` opens a file tree and a syntax-highlighted diff of the
+working tree (staged, unstaged, untracked) that updates live as an agent works, marks
+what changed since you last looked, and lets you stage, unstage, discard, undo and commit
+in the same window. Without a path it opens the repository an agent (Claude Code, Codex)
+worked in most recently. One instance: later `goro` calls hand off to the open app.
 
 ## Develop
 
@@ -21,6 +23,9 @@ cargo test --workspace                  # core tests against real temp repos, pl
 | `s` · `S` | stage the hunk, selection or file under the cursor (unstage if staged) · whole file |
 | `x` · `X` | discard it (refused if the file changed since you looked) · whole file |
 | `u` (`cmd-z`) | undo the last stage/unstage/discard |
+| `tab` · `shift-tab` · `m` | next/previous line changed since you last looked · mark all seen |
+| `r` | mark the hunk (or file, on its header) reviewed; it collapses |
+| `cmd-p` / `ctrl-p` | switch repository (recent and agent-active ones) |
 | `c` · `cmd-enter` · `esc` | focus the commit message · commit · back to the diff |
 | `cmd-q` / `ctrl-q` | quit |
 

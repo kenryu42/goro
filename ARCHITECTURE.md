@@ -152,7 +152,6 @@ Goro stores its state as ordinary git objects under `refs/goro/`, so it's gc-saf
 portable with the repo, and removable with `goro clean`:
 
 ```
-refs/goro/seen                      last-look snapshot (tree) → "new since last look"
 refs/goro/turns/<session>/<n>       turn snapshots (commit; message = prompt metadata)
 refs/goro/undo                      chain of commits holding pre-discard content (raw blobs)
 refs/goro/undo-previous             the previous undo generation
@@ -164,34 +163,65 @@ a new chain starts, so nothing is ever rewritten. Turn snapshots (M3) will be pr
 age and count on launch. Refs under `refs/goro/` show up in `git log --all`; that trade-off is
 documented, and it's how GitButler and others persist state too.
 
-Non-git state (window layout, reviewed marks, comments, MRU repos, activity log) lives in
-the platform data dir (`dirs`): `~/Library/Application Support/Goro`,
-`$XDG_STATE_HOME/goro`, `%LOCALAPPDATA%\Goro`. `GORO_DATA_DIR` overrides it, and tests
-always set it to a temp dir.
+Non-git state lives in the platform data dir (`goro_core::store`, via `dirs`:
+`~/Library/Application Support/Goro`, `~/.local/share/Goro`, `%LOCALAPPDATA%\Goro`).
+`GORO_DATA_DIR` overrides it, and tests always set it to a temp dir. Files are JSON,
+written atomically (temp file + rename); unreadable state reads as empty.
+
+```
+recent.json                  recently opened repositories (most recent first, 50 max)
+repos/<fnv(root)>.json       per repository: lines seen at the last look, reviewed hunk hashes
+```
+
+Keys are FNV-1a hashes (`store::stable_hash`, pinned by a test) so they stay valid across
+Rust versions.
 
 ## Watch mode
 
 - One `notify` watcher per open repo on the worktree root plus `.git/index`, `.git/HEAD`,
   `.git/refs` (and `packed-refs`); `.git/objects` and ignored paths are filtered out.
-- Events are debounced (≈40 ms trailing) and coalesced into a path set.
-  - Worktree paths → re-status and re-diff only those paths.
-  - Index / HEAD / refs → full status refresh (still streamed).
+- Events are debounced (25 ms trailing, at most 100 ms while events keep coming), then
+  paths git ignores (checked with the path and every parent directory, as git does) and
+  `.git` internals other than index/HEAD/refs are dropped. A new or removed directory
+  makes every path dirty.
+- Every reload re-runs status, then reuses already loaded files whose section, paths and
+  blob ids are unchanged and whose worktree side isn't dirty (`review::reuse_loads`);
+  only the rest is re-diffed.
+- One reload runs at a time. Changes arriving meanwhile are merged and trigger exactly one
+  follow-up, so a busy agent can't starve the view with cancelled reloads.
 - The app itself is a writer (stage, discard, commit); self-inflicted events are not
   special-cased. The refresh is cheap and idempotent.
-- "Last look" = the snapshot taken when the Goro window loses focus after being focused
-  for ≥ 1 s, or when you press "mark all seen". New-since-last-look = diff(`refs/goro/seen`,
-  worktree) intersected with the current change set.
+- **New since last look** is per changed line: `(kind, content)` hashed per path
+  (`review::line_hash`), independent of line numbers and section, so staging or moving a
+  line never makes it new. A look is recorded when the window loses focus after ≥ 1 s,
+  on `m`, and once on first open (so a fresh repository starts with nothing new). This
+  replaces the planned `refs/goro/seen` tree: no git writes, and it survives staging.
+- **Reviewed** marks key a hunk by its path and changed lines (`review::hunk_hash`), so any
+  edit to the hunk clears the mark. Reviewed hunks collapse to their header; stale marks
+  are pruned on save.
+
+Measured on golang/go (M3 Pro): write → watcher report ≈ 58 ms, status ≈ 78 ms, so an edit
+appears in about 150 ms; small repositories are much faster.
 
 ## Agent integration
 
-**Repo auto-detect (read-only, no setup):**
-- Goro activity log (written by `goro hook`) is checked first.
-- Claude Code: newest `~/.claude/projects/*/*.jsonl` by mtime; read `cwd` from its
-  records.
-- Codex: newest `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` (scan today and yesterday
-  only); `cwd` from the first `session_meta` line.
-- `cwd` → repo root via git discovery. Missing or unparseable logs are skipped silently;
-  formats are treated as unstable and covered by fixture tests.
+**Repo auto-detect (read-only, no setup; `goro_core::detect`):**
+- Used when no path is given and the CLI isn't run from inside a repository (a desktop
+  launch starts in `/` or `$HOME`, which says nothing about intent).
+- Claude Code (`$CLAUDE_CONFIG_DIR` or `~/.claude`): the newest `projects/*/*.jsonl` by
+  mtime; the last `cwd` in its final 64 KB.
+- Codex (`$CODEX_HOME` or `~/.codex`): rollouts in the two newest `sessions/YYYY/MM/DD`
+  folders; `cwd` from the `session_meta` line.
+- The newest activity inside a repository wins (a deleted directory resolves from its
+  nearest existing ancestor); then recently opened repositories. Unreadable logs are
+  skipped; formats are covered by fixture tests. (The `goro hook` activity log joins in M3.)
+
+**Single instance (`goro/src/ipc.rs`):** a per-user local socket (Linux abstract
+namespace, Windows named pipe, a socket file in the per-user temp dir on macOS). A new
+`goro` sends `open\t<path>` and exits (≈ 5 ms round trip); the running app focuses the
+window already showing that repository or opens a new one. From a terminal, the first
+instance re-launches itself detached (`GORO_NO_DETACH` marks the child) so the shell gets
+its prompt back.
 
 **Hooks:**
 - Claude Code: `UserPromptSubmit` → snapshot "turn start"; `Stop` → snapshot "turn end" and
@@ -254,6 +284,7 @@ timeouts, except `commit`, which waits for hooks.
 
 | Risk | Mitigation |
 |---|---|
+| GPUI's macOS frame loop checks every vsync while a window is visible (≈ 1–2 % CPU idle on an M3 Pro, 0 when hidden) | Upstream behavior; revisit if it matters in practice. Not patched to avoid forking GPUI |
 | GPUI API churn, sparse docs, weaker agent output | Exact pins; reference checkouts; thin UI crate; most logic in goro-core behind tests. M0 is the gate. |
 | Windows cold start (Defender scan, DirectX init) | Measure in M0; signed binaries; keep the binary small |
 | Linux: Wayland hotkeys, inotify watch limits on huge repos | Portal hotkey where supported; watch limits surfaced to the user (see open questions) |

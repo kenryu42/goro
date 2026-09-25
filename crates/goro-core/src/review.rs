@@ -1,7 +1,7 @@
 //! The review model: every change in a repository, the continuous diff stream shown to the
 //! user (as display rows), and the file tree that navigates it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,6 +10,7 @@ use gix::bstr::ByteSlice;
 
 use crate::diff::{FileDiff, LineKind};
 use crate::repo::{FileChange, Loaded, Repo, Section, ThreadRepo};
+use crate::store::stable_hash;
 use crate::syntax::{self, Language, Span, Style};
 
 /// Syntax spans for both sides of a text diff.
@@ -101,6 +102,58 @@ fn retain_on_lines(mut spans: Vec<Span>, lines: &[Range<usize>]) -> Vec<Span> {
     });
     spans.shrink_to_fit();
     spans
+}
+
+/// Which worktree paths may have changed since a review was loaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Dirty {
+    All,
+    Paths(HashSet<gix::bstr::BString>),
+}
+
+impl Dirty {
+    pub fn merge(&mut self, other: Dirty) {
+        match (&mut *self, other) {
+            (Dirty::All, _) => {}
+            (_, Dirty::All) => *self = Dirty::All,
+            (Dirty::Paths(mine), Dirty::Paths(theirs)) => mine.extend(theirs),
+        }
+    }
+
+    fn contains(&self, path: &gix::bstr::BString) -> bool {
+        match self {
+            Dirty::All => true,
+            Dirty::Paths(paths) => paths.contains(path),
+        }
+    }
+}
+
+/// For each of `changes`, the load from `previous` that is still valid: same section,
+/// paths and blob ids, and no worktree side at a dirty path. `None` must be reloaded.
+pub fn reuse_loads(
+    previous: &[ReviewFile],
+    changes: &[FileChange],
+    dirty: &Dirty,
+) -> Vec<Option<FileLoad>> {
+    changes
+        .iter()
+        .map(|change| {
+            let touches_dirty_worktree = [&change.old, &change.new]
+                .into_iter()
+                .any(|side| *side == crate::repo::Source::Worktree)
+                && dirty.contains(&change.path);
+            if touches_dirty_worktree {
+                return None;
+            }
+            previous
+                .iter()
+                .find(|f| f.change == *change && !matches!(f.content, Content::Pending))
+                .map(|f| FileLoad {
+                    content: f.content.clone(),
+                    highlights: f.highlights.clone(),
+                })
+        })
+        .collect()
 }
 
 /// Load `indices` of `changes` in parallel, calling `sink` as each file finishes.
@@ -203,6 +256,43 @@ pub struct Review {
     hunk_rows: Vec<usize>,
     tree: Vec<TreeRow>,
     collapsed: HashSet<(Section, String)>,
+    /// Changed lines at the last look; `None` means nothing counts as new.
+    seen: Option<Seen>,
+    /// Rows of changed lines not in `seen`, sorted.
+    new_rows: Vec<usize>,
+    new_per_file: Vec<usize>,
+    /// Hashes of reviewed hunks (see [`hunk_hash`]).
+    reviewed: HashSet<u64>,
+    /// Per file, the hash of each hunk (computed on rebuild).
+    hunk_hashes: Vec<Vec<u64>>,
+}
+
+/// Changed-line hashes per path, as of the last look.
+pub type Seen = HashMap<String, HashSet<u64>>;
+
+/// Identity of a changed line for "new since last look": its kind and content, not its
+/// position or section, so moving or staging a line doesn't make it new.
+pub fn line_hash(kind: LineKind, content: &[u8]) -> u64 {
+    let kind = [match kind {
+        LineKind::Added => b'+',
+        LineKind::Removed => b'-',
+        LineKind::Context => b' ',
+    }];
+    stable_hash(&[&kind, content])
+}
+
+/// Identity of a hunk for reviewed marks: its file and changed lines. Any edit to the
+/// hunk's changes makes it a different hunk.
+pub fn hunk_hash(path: &[u8], diff: &FileDiff, hunk: usize) -> u64 {
+    let mut parts: Vec<&[u8]> = vec![path];
+    for line in &diff.lines[diff.hunks[hunk].lines.clone()] {
+        match line.kind {
+            LineKind::Added => parts.extend([b"+".as_slice(), diff.line_bytes(line)]),
+            LineKind::Removed => parts.extend([b"-".as_slice(), diff.line_bytes(line)]),
+            LineKind::Context => {}
+        }
+    }
+    stable_hash(&parts)
 }
 
 impl Review {
@@ -223,6 +313,11 @@ impl Review {
             hunk_rows: Vec::new(),
             tree: Vec::new(),
             collapsed: HashSet::new(),
+            seen: None,
+            new_rows: Vec::new(),
+            new_per_file: Vec::new(),
+            reviewed: HashSet::new(),
+            hunk_hashes: Vec::new(),
         };
         review.rebuild_rows();
         review.rebuild_tree();
@@ -366,7 +461,23 @@ impl Review {
         self.rows.clear();
         self.file_rows.clear();
         self.hunk_rows.clear();
+        self.new_rows.clear();
+        self.new_per_file = vec![0; self.files.len()];
+        self.hunk_hashes = self
+            .files
+            .iter()
+            .map(|entry| match entry.diff() {
+                Some(diff) => (0..diff.hunks.len())
+                    .map(|h| hunk_hash(&entry.change.path, diff, h))
+                    .collect(),
+                None => Vec::new(),
+            })
+            .collect();
         for (file, entry) in self.files.iter().enumerate() {
+            let seen = self
+                .seen
+                .as_ref()
+                .map(|seen| seen.get(entry.change.path.to_str_lossy().as_ref()));
             self.file_rows.push(self.rows.len());
             self.rows.push(Row::File { file });
             let note = match &entry.content {
@@ -390,8 +501,23 @@ impl Review {
                             file,
                             hunk: hunk_ix,
                         });
-                        self.rows
-                            .extend(hunk.lines.clone().map(|line| Row::Line { file, line }));
+                        if self.reviewed.contains(&self.hunk_hashes[file][hunk_ix]) {
+                            continue;
+                        }
+                        for line in hunk.lines.clone() {
+                            let l = &diff.lines[line];
+                            let is_new = l.kind != LineKind::Context
+                                && seen.is_some_and(|seen| {
+                                    !seen.is_some_and(|s| {
+                                        s.contains(&line_hash(l.kind, diff.line_bytes(l)))
+                                    })
+                                });
+                            if is_new {
+                                self.new_rows.push(self.rows.len());
+                                self.new_per_file[file] += 1;
+                            }
+                            self.rows.push(Row::Line { file, line });
+                        }
                     }
                     None
                 }
@@ -402,9 +528,119 @@ impl Review {
         }
     }
 
+    /// Set what the user saw at their last look. Call [`Review::rebuild_rows`] after.
+    pub fn set_seen(&mut self, seen: Option<Seen>) {
+        self.seen = seen;
+    }
+
+    /// Every changed line now: what "seen" becomes when the user looks.
+    pub fn snapshot_seen(&self) -> Seen {
+        let mut seen = Seen::new();
+        for entry in &self.files {
+            let Some(diff) = entry.diff() else {
+                continue;
+            };
+            let lines = seen
+                .entry(entry.change.path.to_str_lossy().into_owned())
+                .or_default();
+            lines.extend(
+                diff.lines
+                    .iter()
+                    .filter(|l| l.kind != LineKind::Context)
+                    .map(|l| line_hash(l.kind, diff.line_bytes(l))),
+            );
+        }
+        seen
+    }
+
+    pub fn seen(&self) -> Option<&Seen> {
+        self.seen.as_ref()
+    }
+
+    pub fn is_new(&self, row: usize) -> bool {
+        self.new_rows.binary_search(&row).is_ok()
+    }
+
+    pub fn new_count(&self) -> usize {
+        self.new_rows.len()
+    }
+
+    pub fn file_new_count(&self, file: usize) -> usize {
+        self.new_per_file.get(file).copied().unwrap_or(0)
+    }
+
+    pub fn next_new_row(&self, row: usize) -> Option<usize> {
+        let ix = self.new_rows.partition_point(|&r| r <= row);
+        self.new_rows.get(ix).copied()
+    }
+
+    pub fn prev_new_row(&self, row: usize) -> Option<usize> {
+        let ix = self.new_rows.partition_point(|&r| r < row);
+        ix.checked_sub(1).map(|ix| self.new_rows[ix])
+    }
+
+    /// Set reviewed hunk hashes. Call [`Review::rebuild_rows`] after.
+    pub fn set_reviewed(&mut self, reviewed: HashSet<u64>) {
+        self.reviewed = reviewed;
+    }
+
+    pub fn hunk_is_reviewed(&self, file: usize, hunk: usize) -> bool {
+        self.hunk_hashes
+            .get(file)
+            .and_then(|h| h.get(hunk))
+            .is_some_and(|hash| self.reviewed.contains(hash))
+    }
+
+    /// Every hunk of the file is reviewed (and it has at least one).
+    pub fn file_is_reviewed(&self, file: usize) -> bool {
+        self.hunk_hashes
+            .get(file)
+            .is_some_and(|h| !h.is_empty() && h.iter().all(|hash| self.reviewed.contains(hash)))
+    }
+
+    /// Toggle reviewed for the hunk at `row` (a hunk header or one of its lines), or for
+    /// the whole file on its header. Rebuilds rows.
+    pub fn toggle_reviewed(&mut self, row: usize) {
+        let Some(&row) = self.rows.get(row) else {
+            return;
+        };
+        let file = row.file();
+        let hunks: Vec<usize> = match row {
+            Row::Hunk { hunk, .. } => vec![hunk],
+            Row::Line { line, .. } => self.files[file]
+                .diff()
+                .and_then(|d| d.hunks.iter().position(|h| h.lines.contains(&line)))
+                .into_iter()
+                .collect(),
+            Row::File { .. } | Row::Note { .. } => (0..self.hunk_hashes[file].len()).collect(),
+        };
+        let mark = !hunks.iter().all(|&h| self.hunk_is_reviewed(file, h));
+        for h in hunks {
+            let hash = self.hunk_hashes[file][h];
+            if mark {
+                self.reviewed.insert(hash);
+            } else {
+                self.reviewed.remove(&hash);
+            }
+        }
+        self.rebuild_rows();
+    }
+
+    /// Reviewed marks for hunks that still exist (stale marks are dropped).
+    pub fn reviewed_for_save(&self) -> HashSet<u64> {
+        self.hunk_hashes
+            .iter()
+            .flatten()
+            .filter(|hash| self.reviewed.contains(hash))
+            .copied()
+            .collect()
+    }
+
     /// Keep view state (collapsed directories) from the review this one replaces.
     pub fn carry_view_state(&mut self, previous: &Review) {
         self.collapsed = previous.collapsed.clone();
+        self.seen = previous.seen.clone();
+        self.reviewed = previous.reviewed.clone();
         self.rebuild_tree();
     }
 
@@ -549,7 +785,7 @@ mod tests {
     use super::*;
     use crate::diff::{FileDiff, LineKind};
     use crate::repo::{ChangeStatus, Source};
-    use crate::review::Target;
+    use crate::review::{Dirty, Target, reuse_loads};
 
     fn change(section: Section, path: &str) -> FileChange {
         FileChange {
@@ -698,6 +934,165 @@ mod tests {
         );
         // A selection including the file header is the whole file.
         assert_eq!(review.action_target(a, Some(0)), Some((0, WholeFile)));
+    }
+
+    #[test]
+    fn unchanged_files_are_reused_on_reload() {
+        let blob = |n: u8| Source::Blob {
+            id: gix::ObjectId::from_bytes_or_panic(&[n; 20]),
+            kind: gix::objs::tree::EntryKind::Blob,
+        };
+        let staged = FileChange {
+            section: Section::Staged,
+            status: ChangeStatus::Modified,
+            path: "s.rs".into(),
+            old_path: None,
+            old: blob(1),
+            new: blob(2),
+        };
+        let mut review = Review::new(
+            PathBuf::from("/r"),
+            vec![
+                staged.clone(),
+                change(Section::Unstaged, "a.rs"),
+                change(Section::Unstaged, "b.rs"),
+            ],
+        );
+        for file in 0..3 {
+            review.set_loaded(file, text_load("x\n", "y\n"));
+        }
+        let restaged = FileChange {
+            new: blob(3),
+            ..staged.clone()
+        };
+        let next = vec![
+            staged.clone(),
+            restaged,
+            change(Section::Unstaged, "a.rs"),
+            change(Section::Unstaged, "b.rs"),
+            change(Section::Untracked, "new.rs"),
+        ];
+        let dirty = Dirty::Paths(["b.rs".into()].into_iter().collect());
+        let reused: Vec<bool> = reuse_loads(&review.files, &next, &dirty)
+            .iter()
+            .map(Option::is_some)
+            .collect();
+        // Same blobs: reused. New blob id: reload. Clean worktree path: reused.
+        // Dirty worktree path: reload. New file: load.
+        assert_eq!(reused, [true, false, true, false, false]);
+        assert!(
+            reuse_loads(&review.files, &next, &Dirty::All)
+                .iter()
+                .enumerate()
+                .all(|(ix, l)| l.is_some() == (ix == 0)),
+            "everything touching the worktree reloads when all paths are dirty"
+        );
+    }
+
+    fn loaded_review(files: &[(Section, &str, &str, &str)]) -> Review {
+        let mut review = Review::new(
+            PathBuf::from("/r"),
+            files.iter().map(|(s, p, _, _)| change(*s, p)).collect(),
+        );
+        for (ix, (_, _, old, new)) in files.iter().enumerate() {
+            review.set_loaded(ix, text_load(old, new));
+        }
+        review.rebuild_rows();
+        review
+    }
+
+    fn new_line_texts(review: &Review) -> Vec<String> {
+        (0..review.rows().len())
+            .filter(|&r| review.is_new(r))
+            .map(|r| match review.rows()[r] {
+                Row::Line { file, line } => {
+                    let diff = review.files[file].diff().unwrap();
+                    String::from_utf8_lossy(diff.line_bytes(&diff.lines[line])).into_owned()
+                }
+                other => panic!("only lines are new: {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn lines_changed_after_the_last_look_are_new() {
+        let old = "a\nb\nc\nd\ne\nf\ng\nh\n";
+        let first = loaded_review(&[(Section::Unstaged, "f.rs", old, &old.replace("b\n", "B\n"))]);
+        assert!(
+            new_line_texts(&first).is_empty(),
+            "no seen state yet: nothing is new"
+        );
+        let seen = first.snapshot_seen();
+
+        // The agent changes g; b's change was already seen, and it has since been staged.
+        let mut next = loaded_review(&[
+            (Section::Staged, "f.rs", old, &old.replace("b\n", "B\n")),
+            (
+                Section::Unstaged,
+                "f.rs",
+                &old.replace("b\n", "B\n"),
+                &old.replace("b\n", "B\n").replace("g\n", "G\n"),
+            ),
+        ]);
+        next.set_seen(Some(seen));
+        next.rebuild_rows();
+        assert_eq!(new_line_texts(&next), ["g", "G"]);
+        let first_new = next.next_new_row(0).unwrap();
+        assert_eq!(next.next_new_row(first_new), Some(first_new + 1));
+        assert_eq!(next.prev_new_row(first_new + 1), Some(first_new));
+        assert_eq!(next.file_new_count(0), 0);
+        assert_eq!(next.file_new_count(1), 2);
+    }
+
+    #[test]
+    fn reviewed_hunks_collapse_and_reset_when_their_content_changes() {
+        let old: String = (1..=30).map(|i| format!("line {i}\n")).collect();
+        let new = old
+            .replace("line 3\n", "line three\n")
+            .replace("line 25\n", "line twenty-five\n");
+        let mut review = loaded_review(&[(Section::Unstaged, "f.rs", &old, &new)]);
+        let rows_before = review.rows().len();
+        let second_hunk = review
+            .next_hunk_row(review.next_hunk_row(0).unwrap())
+            .unwrap();
+        review.toggle_reviewed(second_hunk);
+        assert!(review.hunk_is_reviewed(0, 1));
+        assert!(!review.file_is_reviewed(0));
+        assert_eq!(review.rows().len(), rows_before - 8, "hunk lines hidden");
+        // Reviewing from the file header reviews the rest of the file.
+        review.toggle_reviewed(0);
+        assert!(review.file_is_reviewed(0));
+        let saved = review.reviewed_for_save();
+        assert_eq!(saved.len(), 2);
+
+        // The agent edits the second hunk again: it is no longer reviewed.
+        let mut edited = loaded_review(&[(
+            Section::Unstaged,
+            "f.rs",
+            &old,
+            &new.replace("twenty-five", "25!"),
+        )]);
+        edited.set_reviewed(saved);
+        edited.rebuild_rows();
+        assert!(edited.hunk_is_reviewed(0, 0));
+        assert!(!edited.hunk_is_reviewed(0, 1));
+        assert_eq!(
+            edited.reviewed_for_save().len(),
+            1,
+            "stale marks are pruned"
+        );
+    }
+
+    #[test]
+    fn dirty_sets_merge() {
+        let paths = |ps: &[&str]| Dirty::Paths(ps.iter().map(|p| (*p).into()).collect());
+        let mut d = paths(&["a"]);
+        d.merge(paths(&["b"]));
+        assert_eq!(d, paths(&["a", "b"]));
+        d.merge(Dirty::All);
+        assert_eq!(d, Dirty::All);
+        d.merge(paths(&["c"]));
+        assert_eq!(d, Dirty::All);
     }
 
     #[test]

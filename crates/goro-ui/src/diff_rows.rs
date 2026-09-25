@@ -10,7 +10,7 @@ use gpui_kit::{
 };
 
 use crate::theme::Theme;
-use crate::{GoroView, Op, ROW_HEIGHT, section_label};
+use crate::view::{GoroView, Op, ROW_HEIGHT, section_label};
 
 const GUTTER_DIGITS: usize = 5;
 
@@ -19,14 +19,26 @@ pub(crate) fn gutter_width() -> gpui_kit::Pixels {
     px((GUTTER_DIGITS * 2 + 3) as f32 * 7.6)
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct RowFlags {
+    pub is_cursor: bool,
+    pub is_selected: bool,
+    /// A changed line added since the last look.
+    pub is_new: bool,
+}
+
 pub(crate) fn render_row(
     review: &Review,
     ix: usize,
-    is_cursor: bool,
-    is_selected: bool,
+    flags: RowFlags,
     theme: &Theme,
     cx: &mut Context<GoroView>,
 ) -> AnyElement {
+    let RowFlags {
+        is_cursor,
+        is_selected,
+        is_new,
+    } = flags;
     let row = review.rows()[ix];
     let el = match row {
         Row::File { file } => file_header(review, file, Some(ix), theme, cx).h(px(ROW_HEIGHT)),
@@ -42,6 +54,7 @@ pub(crate) fn render_row(
                 header.push_str(&String::from_utf8_lossy(func));
             }
             let section = review.files[file].change.section;
+            let reviewed = review.hunk_is_reviewed(file, hunk);
             div()
                 .id(("row", ix))
                 .h(px(ROW_HEIGHT))
@@ -54,6 +67,9 @@ pub(crate) fn render_row(
                 .text_color(theme.hunk_fg)
                 .whitespace_nowrap()
                 .child(header)
+                .when(reviewed, |el| {
+                    el.child(div().text_color(theme.muted).child("✓ reviewed"))
+                })
                 .children(action_buttons(section, ix, "hunk", theme, cx))
         }
         Row::Line { file, line } => render_line(review, file, line, ix, theme),
@@ -75,6 +91,17 @@ pub(crate) fn render_row(
         }))
         .when(is_selected, |el| {
             el.child(div().absolute().inset_0().bg(theme.selection_bg))
+        })
+        .when(is_new, |el| {
+            el.child(
+                div()
+                    .absolute()
+                    .left(px(4.0))
+                    .top(px(6.0))
+                    .size(px(7.0))
+                    .rounded_full()
+                    .bg(theme.new_marker),
+            )
         })
         .when(is_cursor, |el| {
             el.child(
@@ -126,6 +153,9 @@ pub(crate) fn file_header(
                 .child(badge),
         )
         .child(div().font_weight(FontWeight::BOLD).child(path))
+        .when(review.file_is_reviewed(file), |el| {
+            el.child(div().text_color(theme.muted).child("✓ reviewed"))
+        })
         .child(
             div()
                 .text_color(theme.muted)

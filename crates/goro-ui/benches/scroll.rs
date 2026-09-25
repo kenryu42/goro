@@ -71,6 +71,7 @@ fn main() {
     assert!(status.success());
     let repo = std::sync::Arc::new(goro_core::repo::Repo::discover(dir.path()).unwrap());
     tx.unbounded_send(Event::Opened {
+        state: Default::default(),
         repo,
         changes,
         first: None,
@@ -111,7 +112,7 @@ fn main() {
     };
     let window = cx
         .open_window(size(px(1280.0), px(820.0)), |window, cx| {
-            cx.new(|cx| GoroView::new(startup, Vec::new(), rx, window, cx))
+            cx.new(|cx| GoroView::new(startup, Vec::new(), rx, None, window, cx))
         })
         .unwrap();
     cx.run_until_parked();

@@ -14,6 +14,7 @@ use std::time::Instant;
 use futures::channel::mpsc::unbounded;
 use goro_core::repo::Repo;
 use goro_core::review::{Row, load_file};
+use goro_core::store::Store;
 use goro_ui::{Event, GoroView, NextFile, NextHunk, Startup};
 use gpui_kit::{
     AppContext, Focusable, HeadlessAppContext, Keystroke, WindowAppearance, WindowHandle, px, size,
@@ -103,21 +104,23 @@ fn fixture() -> (tempfile::TempDir, PathBuf) {
     (dir, root)
 }
 
-fn open(
-    appearance: WindowAppearance,
-) -> (
-    HeadlessAppContext,
-    WindowHandle<GoroView>,
-    tempfile::TempDir,
-) {
-    let (dir, root) = fixture();
-    let (cx, window) = open_repo(&root, appearance);
-    (cx, window, dir)
+/// Temporary directories that must outlive the window.
+struct Dirs {
+    _repo: tempfile::TempDir,
+    store: tempfile::TempDir,
+}
+
+fn open(appearance: WindowAppearance) -> (HeadlessAppContext, WindowHandle<GoroView>, Dirs) {
+    let (repo, root) = fixture();
+    let store = tempfile::tempdir().unwrap();
+    let (cx, window) = open_repo(&root, appearance, Store::at(store.path()));
+    (cx, window, Dirs { _repo: repo, store })
 }
 
 fn open_repo(
     root: &Path,
     appearance: WindowAppearance,
+    store: Store,
 ) -> (HeadlessAppContext, WindowHandle<GoroView>) {
     let repo = Repo::discover(root).unwrap();
     let changes = repo.status().unwrap();
@@ -127,6 +130,7 @@ fn open_repo(
     drop(thread);
     let mut loads = loads.into_iter();
     tx.unbounded_send(Event::Opened {
+        state: store.repo_state(repo.root()),
         repo: Arc::new(repo),
         changes: changes.clone(),
         first: loads.next(),
@@ -152,7 +156,7 @@ fn open_repo(
     let window = cx
         .open_window(size(px(1100.0), px(640.0)), |window, cx| {
             cx.new(|cx| {
-                let mut view = GoroView::new(startup, Vec::new(), rx, window, cx);
+                let mut view = GoroView::new(startup, Vec::new(), rx, Some(store), window, cx);
                 view.set_appearance(Some(appearance), cx);
                 view
             })
@@ -160,6 +164,26 @@ fn open_repo(
         .unwrap();
     cx.run_until_parked();
     (cx, window)
+}
+
+/// Let real threads (the file watcher, git) and the app's tasks run until `condition`
+/// holds, or panic after `timeout`.
+fn wait_until(
+    cx: &mut HeadlessAppContext,
+    window: WindowHandle<GoroView>,
+    timeout: std::time::Duration,
+    what: &str,
+    condition: impl Fn(&GoroView, &gpui_kit::App) -> bool,
+) {
+    let start = Instant::now();
+    loop {
+        cx.run_until_parked();
+        if read(cx, window, &condition) {
+            return;
+        }
+        assert!(start.elapsed() < timeout, "timed out waiting for {what}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 fn save_screenshot(cx: &mut HeadlessAppContext, window: WindowHandle<GoroView>, name: &str) {
@@ -252,16 +276,12 @@ fn git_out(root: &Path, args: &[&str]) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 
-/// Focus the diff, then press each space-separated key.
+/// Press each space-separated key.
 fn press(cx: &mut HeadlessAppContext, window: WindowHandle<GoroView>, keys: &str) {
     cx.update_window(window.into(), |view, window, cx| {
         let view = view.downcast::<GoroView>().unwrap();
-        if !view
-            .read(cx)
-            .commit_editor()
-            .focus_handle(cx)
-            .is_focused(window)
-        {
+        // Keep focus where the app put it (commit box, switcher); start on the diff.
+        if window.focused(cx).is_none() {
             window.focus(&view.focus_handle(cx), cx);
         }
     })
@@ -416,14 +436,116 @@ fn failing_hook_output_is_shown_in_full() {
     );
 }
 
+fn row_text(view: &GoroView, row: usize) -> String {
+    let review = view.review().unwrap();
+    match review.rows()[row] {
+        Row::Line { file, line } => {
+            let diff = review.files[file].diff().unwrap();
+            String::from_utf8_lossy(diff.line_bytes(&diff.lines[line])).into_owned()
+        }
+        other => format!("{other:?}"),
+    }
+}
+
+fn live_updates_mark_new_lines() {
+    let (mut cx, window, _dirs) = open(WindowAppearance::Dark);
+    let root = root_of(&mut cx, window);
+    let new_count =
+        |cx: &mut HeadlessAppContext| read(cx, window, |v, _| v.review().unwrap().new_count());
+    assert_eq!(new_count(&mut cx), 0, "the first look is taken on open");
+
+    // An agent edits a file while Goro is open.
+    std::fs::write(
+        root.join("web/app.ts"),
+        "export function greet(name: string): string {\n  return `Hi, ${name}!`;\n}\n",
+    )
+    .unwrap();
+    wait_until(
+        &mut cx,
+        window,
+        std::time::Duration::from_secs(5),
+        "the edit",
+        |v, _| v.review().unwrap().new_count() > 0,
+    );
+    assert_eq!(new_count(&mut cx), 1, "only the changed line is new");
+    press(&mut cx, window, "tab");
+    let text = read(&mut cx, window, |v, _| row_text(v, v.cursor()));
+    assert_eq!(text, "  return `Hi, ${name}!`;");
+    save_screenshot(&mut cx, window, "review-new-lines.png");
+
+    press(&mut cx, window, "m");
+    assert_eq!(new_count(&mut cx), 0);
+}
+
+fn reviewed_marks_collapse_and_persist() {
+    let (mut cx, window, dirs) = open(WindowAppearance::Dark);
+    let root = root_of(&mut cx, window);
+    let rows =
+        |cx: &mut HeadlessAppContext| read(cx, window, |v, _| v.review().unwrap().rows().len());
+    let before = rows(&mut cx);
+    press(&mut cx, window, "n r");
+    assert!(read(&mut cx, window, |v, _| v
+        .review()
+        .unwrap()
+        .hunk_is_reviewed(0, 0)));
+    assert!(rows(&mut cx) < before, "reviewed hunk collapses");
+    save_screenshot(&mut cx, window, "review-reviewed.png");
+    drop(cx);
+
+    let (mut cx, window) = open_repo(&root, WindowAppearance::Dark, Store::at(dirs.store.path()));
+    assert!(
+        read(&mut cx, window, |v, _| v
+            .review()
+            .unwrap()
+            .hunk_is_reviewed(0, 0)),
+        "reviewed marks survive a restart"
+    );
+}
+
+fn switcher_opens_and_dismisses() {
+    let (mut cx, window, dirs) = open(WindowAppearance::Dark);
+    let root = root_of(&mut cx, window);
+    Store::at(dirs.store.path()).touch_recent(&root).unwrap();
+    press(&mut cx, window, "ctrl-p");
+    assert!(read(&mut cx, window, |v, _| v.switcher_open()));
+    // Typing goes to the switcher's filter, not to the diff's shortcuts.
+    let cursor = read(&mut cx, window, |v, _| v.cursor());
+    press(&mut cx, window, "j j");
+    assert_eq!(read(&mut cx, window, |v, _| v.cursor()), cursor);
+    press(&mut cx, window, "escape");
+    assert!(!read(&mut cx, window, |v, _| v.switcher_open()));
+    press(&mut cx, window, "j");
+    assert_eq!(
+        read(&mut cx, window, |v, _| v.cursor()),
+        cursor + 1,
+        "focus back on the diff"
+    );
+
+    // Choosing the repository that's already open just returns to its window.
+    press(&mut cx, window, "ctrl-p");
+    save_screenshot(&mut cx, window, "review-switcher.png");
+    press(&mut cx, window, "enter");
+    assert!(!read(&mut cx, window, |v, _| v.switcher_open()));
+    assert_eq!(
+        cx.update(|cx| cx.windows().len()),
+        1,
+        "no second window for the same repo"
+    );
+}
+
 fn main() {
     // Isolate every git process (including Goro's own) from the user's configuration.
     // SAFETY: no other threads exist yet.
+    let isolated = tempfile::tempdir().unwrap();
     unsafe {
         std::env::set_var("GIT_CONFIG_GLOBAL", "/dev/null");
         std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+        // Never read the user's agent logs or Goro state.
+        std::env::set_var("CLAUDE_CONFIG_DIR", isolated.path().join("claude"));
+        std::env::set_var("CODEX_HOME", isolated.path().join("codex"));
+        std::env::set_var("GORO_DATA_DIR", isolated.path().join("goro"));
     }
-    let tests: [(&str, fn()); 7] = [
+    let tests: [(&str, fn()); 10] = [
         (
             "renders_every_file_in_one_stream",
             renders_every_file_in_one_stream,
@@ -446,6 +568,12 @@ fn main() {
             "failing_hook_output_is_shown_in_full",
             failing_hook_output_is_shown_in_full,
         ),
+        ("live_updates_mark_new_lines", live_updates_mark_new_lines),
+        (
+            "reviewed_marks_collapse_and_persist",
+            reviewed_marks_collapse_and_persist,
+        ),
+        ("switcher_opens_and_dismisses", switcher_opens_and_dismisses),
     ];
     for (name, test) in tests {
         test();
