@@ -14,7 +14,7 @@ interprocess.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }
 
 [build-dependencies]
 # Used only when targeting Windows (build scripts run on the host).

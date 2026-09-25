@@ -121,6 +121,28 @@ fn main() -> ExitCode {
     }
 }
 
+/// Stop child processes from inheriting this process's stdin/stdout/stderr. Unix closes
+/// them for children already (Rust sets close-on-exec); Windows inherits every
+/// inheritable handle, which would keep the agent's pipes open until the worker exits.
+fn keep_std_handles_private() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+        use windows_sys::Win32::System::Console::{
+            GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        };
+        for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            // SAFETY: plain Win32 calls on this process's own standard handles.
+            unsafe {
+                let handle = GetStdHandle(which);
+                if !handle.is_null() {
+                    SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+                }
+            }
+        }
+    }
+}
+
 /// Windows GUI programs have no console; reattach to the caller's so `goro comments`,
 /// `--wait` and friends print where they were run. Output to pipes works either way.
 fn attach_parent_console() {
@@ -187,6 +209,7 @@ fn open(cli: Cli, t0: Instant) -> ExitCode {
     // Git work runs in parallel with platform and window setup.
     let events = goro_ui::spawn_loader(target, store.clone(), startup);
     goro_ui::run(startup, events, requests_rx, store);
+    startup.mark("event loop exited");
     ExitCode::SUCCESS
 }
 
@@ -280,6 +303,8 @@ fn hook(agent: &str, event: &str) {
     if std::io::stdin().read_to_end(&mut payload).is_err() {
         return;
     }
+    // The agent waits until our stdout and stderr close; the worker must not hold them.
+    keep_std_handles_private();
     let spawned = std::env::current_exe().and_then(|exe| {
         let mut command = Command::new(exe);
         command

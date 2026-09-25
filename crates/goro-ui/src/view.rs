@@ -1443,6 +1443,7 @@ impl GoroView {
                     "first_paint_ms={:.1}",
                     startup.t0.elapsed().as_secs_f64() * 1000.0
                 );
+                startup.mark("quitting");
                 cx.quit();
             }
         });
