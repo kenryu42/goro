@@ -9,7 +9,7 @@
 //!   it; otherwise it refuses rather than overwrite newer work.
 
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use gix::bstr::{BStr, BString, ByteSlice};
 
@@ -84,6 +84,8 @@ struct IndexState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FileKind {
     Regular,
+    /// Only detected (and restored) where files have an executable bit.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Executable,
     Symlink,
 }
@@ -635,7 +637,7 @@ fn restore_worktree(git: &Git, full: &Path, saved: Option<&SavedFile>) -> Result
     match saved.kind {
         #[cfg(unix)]
         FileKind::Symlink => {
-            let target: PathBuf = gix::path::from_bstr(bytes.as_bstr()).into_owned();
+            let target: std::path::PathBuf = gix::path::from_bstr(bytes.as_bstr()).into_owned();
             std::os::unix::fs::symlink(target, full)?;
         }
         _ => {
