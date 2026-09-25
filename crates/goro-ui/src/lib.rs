@@ -385,7 +385,8 @@ fn window_for(target: &Path, cx: &App) -> Option<WindowHandle<GoroView>> {
     let target = target.canonicalize().ok()?;
     cx.windows().into_iter().find_map(|window| {
         let window = window.downcast::<GoroView>()?;
-        let root = window.read(cx).ok()?.root()?.to_path_buf();
+        // Both canonical: on Windows that adds a `\\?\` prefix git's paths don't have.
+        let root = window.read(cx).ok()?.root()?.canonicalize().ok()?;
         target.starts_with(root).then_some(window)
     })
 }

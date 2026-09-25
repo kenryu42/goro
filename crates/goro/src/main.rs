@@ -383,8 +383,16 @@ fn hooks_command(action: HooksAction) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         HooksAction::Install { yes } => {
+            // Resolved so hooks survive a package manager's symlink moving. Not on Windows:
+            // canonical paths there start with `\\?\`, which agents' shells mangle.
             let exe = std::env::current_exe()
-                .and_then(|p| p.canonicalize())
+                .and_then(|p| {
+                    if cfg!(windows) {
+                        Ok(p)
+                    } else {
+                        p.canonicalize()
+                    }
+                })
                 .expect("the running executable has a path");
             (hooks::plan_install(&files, &exe), yes, "install")
         }
