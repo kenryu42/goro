@@ -41,6 +41,9 @@ def main() -> int:
             return 1
         ms = float(line.split("=", 1)[1])
         print(f"run {run}: {ms:.1f} ms" + (" (warm-up, excluded)" if run == 0 else ""))
+        if run > 0 and ms > args.budget_ms and out.stderr.strip():
+            # With GORO_TRACE_STARTUP=1: where the time went.
+            print("\n".join("    " + l for l in out.stderr.strip().splitlines()))
         if run > 0:
             times.append(ms)
     median = statistics.median(times)
