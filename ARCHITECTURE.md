@@ -123,17 +123,25 @@ reviewed marks, and "new since last look" highlights stable.
 (`linguist-generated`, `binary`, `diff`), ignore rules, and the worktree **clean filter**
 (so CRLF and other filters produce the same diff `git diff` would).
 
-**Writes (git CLI, spawned with a fixed env, `LC_ALL=C`, no pager, `GIT_OPTIONAL_LOCKS=0`
-for reads that must shell out):**
+**Writes (`goro_core::git::Git`: `git --no-pager --literal-pathspecs`, `GIT_TERMINAL_PROMPT=0`,
+always off the UI thread):**
 
-| Action | Mechanism |
+| Action | Mechanism (`goro_core::ops`, `goro_core::patch`) |
 |---|---|
-| Stage hunk / lines | Build an exact patch for the selection (zero fuzz) → `git apply --cached --recount` |
-| Unstage | Same, reversed against the index → `git apply --cached -R` |
-| Discard hunk / lines | Save undo first (below) → `git apply -R` on the worktree. `git apply` refuses if context or removed lines no longer match: that is the compare-and-swap. Goro also checks the file's blob hash before applying. |
-| Discard whole file | Save undo → `git checkout -- <path>` / delete untracked |
-| Commit | `git commit -F -` (message on stdin), `--amend`/`--signoff` as chosen. Runs in background; hooks and pinentry work as usual; stderr is surfaced on failure. |
-| Snapshot | Temp index (`GIT_INDEX_FILE`) seeded from the real index → `git add -A` → `git write-tree` → `git commit-tree`. The user's index is never touched. |
+| Stage lines / hunk | Exact patch for the selection → `git apply --cached`. Forward patches keep unselected removals as context and drop unselected additions; untracked files get a `new file mode` header |
+| Unstage lines / hunk | Reverse patch (unselected additions become context, unselected removals are dropped) → `git apply --cached -R` |
+| Discard lines / hunk | Compare-and-swap first: the worktree's clean-filtered hash must equal the reviewed diff's new side, else `Stale`. Save raw bytes (below), then reverse patch → `git apply -R` |
+| Whole file | Stage `git add -A`; unstage `git restore --staged` (`git rm --cached` before the first commit); discard `git restore --worktree` or delete an untracked file, after the same save |
+| A selection covering every changed line | Treated as the whole file, so new, deleted and mode-changed files behave as expected |
+| Undo | Index actions record stage-0 entries before/after (`ls-files -s`) and restore with `update-index`; discards restore the saved bytes and mode. Both refuse (`Stale`) unless the current state is exactly what the action left |
+| Commit | `git commit -F -` (message on stdin), `--amend`/`--signoff` as chosen, in the background; hooks and signing work as usual. Failures show the hook's full output. The undo stack is cleared after a commit (its entries refer to the old HEAD) |
+| Snapshot (M3) | Temp index (`GIT_INDEX_FILE`) seeded from the real index → `git add -A` → `git write-tree` → `git commit-tree`. The user's index is never touched. |
+
+Patches are tested by applying random line selections with real `git apply` and comparing
+the result with an independent model (`tests/patch_apply.rs`), including CRLF, missing
+final newlines and new files. A selection that would split an end-of-file newline change
+is refused with a message rather than producing an invalid patch. The undo stack is per
+session; the saved content stays recoverable from the refs below.
 
 Any write that races with an external change fails loudly and triggers a refresh. Never
 retry blindly.
@@ -146,11 +154,14 @@ portable with the repo, and removable with `goro clean`:
 ```
 refs/goro/seen                      last-look snapshot (tree) → "new since last look"
 refs/goro/turns/<session>/<n>       turn snapshots (commit; message = prompt metadata)
-refs/goro/undo                      chain of commits holding pre-discard content
+refs/goro/undo                      chain of commits holding pre-discard content (raw blobs)
+refs/goro/undo-previous             the previous undo generation
 ```
 
-Retention: turns and undo entries older than 14 days or beyond 200 per repo are pruned
-on launch. Refs under `refs/goro/` show up in `git log --all`; that trade-off is
+Retention: undo history keeps two generations of up to 200 discards each; when
+`refs/goro/undo` fills up it becomes `undo-previous` (dropping the generation before) and
+a new chain starts, so nothing is ever rewritten. Turn snapshots (M3) will be pruned by
+age and count on launch. Refs under `refs/goro/` show up in `git log --all`; that trade-off is
 documented, and it's how GitButler and others persist state too.
 
 Non-git state (window layout, reviewed marks, comments, MRU repos, activity log) lives in

@@ -3219,6 +3219,7 @@ dependencies = [
  "goro-core",
  "gpui-kit",
  "tempfile",
+ "unicode-segmentation",
 ]
 
 [[package]]

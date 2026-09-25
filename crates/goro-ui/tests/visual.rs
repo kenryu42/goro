@@ -16,7 +16,7 @@ use goro_core::repo::Repo;
 use goro_core::review::{Row, load_file};
 use goro_ui::{Event, GoroView, NextFile, NextHunk, Startup};
 use gpui_kit::{
-    AppContext, Focusable, HeadlessAppContext, WindowAppearance, WindowHandle, px, size,
+    AppContext, Focusable, HeadlessAppContext, Keystroke, WindowAppearance, WindowHandle, px, size,
 };
 
 fn git(root: &Path, args: &[&str]) {
@@ -111,19 +111,29 @@ fn open(
     tempfile::TempDir,
 ) {
     let (dir, root) = fixture();
-    let repo = Repo::discover(&root).unwrap();
+    let (cx, window) = open_repo(&root, appearance);
+    (cx, window, dir)
+}
+
+fn open_repo(
+    root: &Path,
+    appearance: WindowAppearance,
+) -> (HeadlessAppContext, WindowHandle<GoroView>) {
+    let repo = Repo::discover(root).unwrap();
     let changes = repo.status().unwrap();
     let thread = repo.thread_local();
     let (tx, rx) = unbounded();
+    let loads: Vec<_> = changes.iter().map(|c| load_file(&thread, c)).collect();
+    drop(thread);
+    let mut loads = loads.into_iter();
     tx.unbounded_send(Event::Opened {
-        root: repo.root().to_path_buf(),
+        repo: Arc::new(repo),
         changes: changes.clone(),
-        first: Some(load_file(&thread, &changes[0])),
+        first: loads.next(),
     })
     .unwrap();
-    for (ix, change) in changes.iter().enumerate().skip(1) {
-        tx.unbounded_send(Event::Loaded(ix, load_file(&thread, change)))
-            .unwrap();
+    for (ix, load) in loads.enumerate() {
+        tx.unbounded_send(Event::Loaded(ix + 1, load)).unwrap();
     }
     drop(tx);
 
@@ -133,6 +143,7 @@ fn open(
         Arc::new(()),
         gpui_kit::platform::current_headless_renderer,
     );
+    cx.update(goro_ui::bind_keys);
     let startup = Startup {
         t0: Instant::now(),
         trace: false,
@@ -148,7 +159,7 @@ fn open(
         })
         .unwrap();
     cx.run_until_parked();
-    (cx, window, dir)
+    (cx, window)
 }
 
 fn save_screenshot(cx: &mut HeadlessAppContext, window: WindowHandle<GoroView>, name: &str) {
@@ -230,8 +241,189 @@ fn keyboard_moves_between_hunks_and_files() {
     ));
 }
 
+fn git_out(root: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .current_dir(root)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(args)
+        .output()
+        .unwrap();
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// Focus the diff, then press each space-separated key.
+fn press(cx: &mut HeadlessAppContext, window: WindowHandle<GoroView>, keys: &str) {
+    cx.update_window(window.into(), |view, window, cx| {
+        let view = view.downcast::<GoroView>().unwrap();
+        if !view
+            .read(cx)
+            .commit_editor()
+            .focus_handle(cx)
+            .is_focused(window)
+        {
+            window.focus(&view.focus_handle(cx), cx);
+        }
+    })
+    .unwrap();
+    for key in keys.split(' ') {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.dispatch_keystroke(Keystroke::parse(key).unwrap(), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+}
+
+fn read<R>(
+    cx: &mut HeadlessAppContext,
+    window: WindowHandle<GoroView>,
+    f: impl FnOnce(&GoroView, &gpui_kit::App) -> R,
+) -> R {
+    cx.update(|cx| window.read_with(cx, |view, cx| f(view, cx)))
+        .unwrap()
+}
+
+fn root_of(cx: &mut HeadlessAppContext, window: WindowHandle<GoroView>) -> PathBuf {
+    read(cx, window, |view, _| view.review().unwrap().root.clone())
+}
+
+fn stage_selected_lines_then_undo() {
+    let (mut cx, window, _dir) = open(WindowAppearance::Dark);
+    let root = root_of(&mut cx, window);
+    // src/words.rs is the fourth file; its first changed lines are the doc comment.
+    press(&mut cx, window, "] ] ] n j j j shift-j s");
+    let staged = git_out(&root, &["diff", "--cached", "--", "src/words.rs"]);
+    assert!(
+        staged.contains("+/// Counts words in a text, case-insensitively."),
+        "{staged}"
+    );
+    assert!(
+        !staged.contains("to_lowercase"),
+        "only the selected lines: {staged}"
+    );
+    let status = read(&mut cx, window, |v, _| {
+        v.status_text().map(|(t, e)| (t.to_string(), e))
+    });
+    assert_eq!(
+        status,
+        Some((
+            "Staged 2 lines of src/words.rs  (u to undo)".to_string(),
+            false
+        ))
+    );
+    let staged_files = read(&mut cx, window, |v, _| {
+        v.review()
+            .unwrap()
+            .files
+            .iter()
+            .filter(|f| f.change.section == goro_core::repo::Section::Staged)
+            .map(|f| f.change.path_lossy().into_owned())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        staged_files,
+        ["README.md", "src/words.rs"],
+        "review reloaded"
+    );
+    save_screenshot(&mut cx, window, "review-staged.png");
+
+    press(&mut cx, window, "u");
+    assert_eq!(
+        git_out(&root, &["diff", "--cached", "--", "src/words.rs"]),
+        ""
+    );
+}
+
+fn discard_file_then_undo() {
+    let (mut cx, window, _dir) = open(WindowAppearance::Dark);
+    let root = root_of(&mut cx, window);
+    // old.txt (deleted in the worktree) is the third file.
+    press(&mut cx, window, "] ] x");
+    assert_eq!(
+        std::fs::read_to_string(root.join("old.txt")).unwrap(),
+        "remove me\n"
+    );
+    press(&mut cx, window, "u");
+    assert!(!root.join("old.txt").exists(), "undo deletes it again");
+}
+
+fn commit_box_takes_typing_and_commits() {
+    let (mut cx, window, _dir) = open(WindowAppearance::Dark);
+    let root = root_of(&mut cx, window);
+    let cursor_before = read(&mut cx, window, |v, _| v.cursor());
+    press(&mut cx, window, "c");
+    // Letters that are shortcuts in the diff must type into the editor.
+    press(&mut cx, window, "shift-f i x space j s x");
+    let text = read(&mut cx, window, |v, cx| {
+        v.commit_editor().read(cx).text().to_string()
+    });
+    assert_eq!(text, "Fix jsx");
+    assert_eq!(read(&mut cx, window, |v, _| v.cursor()), cursor_before);
+    save_screenshot(&mut cx, window, "review-commit-box.png");
+
+    press(&mut cx, window, "ctrl-enter");
+    assert_eq!(
+        git_out(&root, &["log", "-1", "--format=%s"]).trim(),
+        "Fix jsx"
+    );
+    assert_eq!(git_out(&root, &["diff", "--cached", "--name-only"]), "");
+    let text = read(&mut cx, window, |v, cx| {
+        v.commit_editor().read(cx).text().to_string()
+    });
+    assert_eq!(text, "", "editor cleared after commit");
+}
+
+fn failing_hook_output_is_shown_in_full() {
+    let (mut cx, window, _dir) = open(WindowAppearance::Dark);
+    let root = root_of(&mut cx, window);
+    let hook = root.join(".git/hooks/pre-commit");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\necho 'lint: README.md:3 trailing whitespace' >&2\necho 'lint: 1 problem' >&2\nexit 1\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    press(&mut cx, window, "c");
+    press(&mut cx, window, "w i p ctrl-enter");
+    let (text, is_error) = read(&mut cx, window, |v, _| {
+        v.status_text().map(|(t, e)| (t.to_string(), e)).unwrap()
+    });
+    assert!(is_error);
+    assert!(
+        text.contains("README.md:3 trailing whitespace") && text.contains("1 problem"),
+        "{text}"
+    );
+    assert!(text.starts_with("Commit failed:\n"), "{text}");
+    assert_eq!(
+        git_out(&root, &["log", "--oneline"]).lines().count(),
+        1,
+        "nothing committed"
+    );
+    save_screenshot(&mut cx, window, "review-hook-failure.png");
+    // The first escape leaves the commit box; the next dismisses the error.
+    press(&mut cx, window, "escape");
+    assert!(read(&mut cx, window, |v, _| v.status_text().is_some()));
+    press(&mut cx, window, "escape");
+    assert!(
+        read(&mut cx, window, |v, _| v.status_text().is_none()),
+        "esc dismisses"
+    );
+}
+
 fn main() {
-    let tests: [(&str, fn()); 3] = [
+    // Isolate every git process (including Goro's own) from the user's configuration.
+    // SAFETY: no other threads exist yet.
+    unsafe {
+        std::env::set_var("GIT_CONFIG_GLOBAL", "/dev/null");
+        std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+    }
+    let tests: [(&str, fn()); 7] = [
         (
             "renders_every_file_in_one_stream",
             renders_every_file_in_one_stream,
@@ -240,6 +432,19 @@ fn main() {
         (
             "keyboard_moves_between_hunks_and_files",
             keyboard_moves_between_hunks_and_files,
+        ),
+        (
+            "stage_selected_lines_then_undo",
+            stage_selected_lines_then_undo,
+        ),
+        ("discard_file_then_undo", discard_file_then_undo),
+        (
+            "commit_box_takes_typing_and_commits",
+            commit_box_takes_typing_and_commits,
+        ),
+        (
+            "failing_hook_output_is_shown_in_full",
+            failing_hook_output_is_shown_in_full,
         ),
     ];
     for (name, test) in tests {

@@ -178,6 +178,23 @@ pub enum TreeRow {
     },
 }
 
+/// What a stage/unstage/discard applies to within one file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    WholeFile,
+    /// Indices into the file's diff lines.
+    Lines(Vec<usize>),
+}
+
+/// A position in the stream that survives a reload: a file (by section and path) and a
+/// row offset within it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Anchor {
+    pub section: Section,
+    pub path: gix::bstr::BString,
+    pub offset: usize,
+}
+
 pub struct Review {
     pub root: PathBuf,
     pub files: Vec<ReviewFile>,
@@ -257,6 +274,80 @@ impl Review {
         ix.checked_sub(1).map(|ix| self.file_rows[ix])
     }
 
+    /// The file and part of it an action applies to. With a selection (`anchor` to
+    /// `cursor`), the selected lines of the cursor's file; a selection that includes the
+    /// file header is the whole file. Without one: the hunk under the cursor, or the whole
+    /// file on its header or a note.
+    pub fn action_target(&self, cursor: usize, anchor: Option<usize>) -> Option<(usize, Target)> {
+        let file = self.rows.get(cursor)?.file();
+        let hunk_lines = |hunk: usize| -> Vec<usize> {
+            self.files[file]
+                .diff()
+                .map(|d| d.hunks[hunk].lines.clone().collect())
+                .unwrap_or_default()
+        };
+        let target = match anchor {
+            Some(anchor) => {
+                let range = anchor.min(cursor)..=anchor.max(cursor);
+                let mut lines = Vec::new();
+                for row in &self.rows[range] {
+                    match *row {
+                        Row::File { file: f } if f == file => {
+                            return Some((file, Target::WholeFile));
+                        }
+                        Row::Hunk { file: f, hunk } if f == file => lines.extend(hunk_lines(hunk)),
+                        Row::Line { file: f, line } if f == file => lines.push(line),
+                        _ => {}
+                    }
+                }
+                lines.sort_unstable();
+                lines.dedup();
+                Target::Lines(lines)
+            }
+            None => match self.rows[cursor] {
+                Row::File { .. } | Row::Note { .. } => Target::WholeFile,
+                Row::Hunk { hunk, .. } => Target::Lines(hunk_lines(hunk)),
+                Row::Line { line, .. } => {
+                    let diff = self.files[file].diff()?;
+                    let hunk = diff.hunks.iter().position(|h| h.lines.contains(&line))?;
+                    Target::Lines(hunk_lines(hunk))
+                }
+            },
+        };
+        Some((file, target))
+    }
+
+    pub fn anchor(&self, row: usize) -> Option<Anchor> {
+        let file = self.rows.get(row)?.file();
+        let change = &self.files[file].change;
+        Some(Anchor {
+            section: change.section,
+            path: change.path.clone(),
+            offset: row - self.file_rows[file],
+        })
+    }
+
+    /// The row for `anchor`: the same offset in the same file (clamped), or the start of
+    /// the file that now sorts after it.
+    pub fn resolve(&self, anchor: &Anchor) -> usize {
+        let key = (anchor.section, &anchor.path);
+        let ix = self
+            .files
+            .partition_point(|f| (f.change.section, &f.change.path) < key);
+        match self.files.get(ix) {
+            Some(f) if (f.change.section, &f.change.path) == key => {
+                let end = self
+                    .file_rows
+                    .get(ix + 1)
+                    .copied()
+                    .unwrap_or(self.rows.len());
+                (self.file_rows[ix] + anchor.offset).min(end - 1)
+            }
+            Some(_) => self.file_rows[ix],
+            None => self.rows.len().saturating_sub(1),
+        }
+    }
+
     /// Index of the longest row, for sizing horizontal scroll.
     pub fn widest_row(&self) -> Option<usize> {
         self.rows
@@ -309,6 +400,12 @@ impl Review {
                 self.rows.push(Row::Note { file, note });
             }
         }
+    }
+
+    /// Keep view state (collapsed directories) from the review this one replaces.
+    pub fn carry_view_state(&mut self, previous: &Review) {
+        self.collapsed = previous.collapsed.clone();
+        self.rebuild_tree();
     }
 
     pub fn toggle_dir(&mut self, section: Section, path: &str) {
@@ -452,6 +549,7 @@ mod tests {
     use super::*;
     use crate::diff::{FileDiff, LineKind};
     use crate::repo::{ChangeStatus, Source};
+    use crate::review::Target;
 
     fn change(section: Section, path: &str) -> FileChange {
         FileChange {
@@ -520,6 +618,89 @@ mod tests {
     }
 
     #[test]
+    fn anchors_survive_a_reload() {
+        let mut before = Review::new(
+            PathBuf::from("/r"),
+            vec![
+                change(Section::Unstaged, "a.rs"),
+                change(Section::Unstaged, "b.rs"),
+                change(Section::Unstaged, "c.rs"),
+            ],
+        );
+        for file in 0..3 {
+            before.set_loaded(file, text_load("x\ny\nz\n", "x\nY\nz\n"));
+        }
+        before.rebuild_rows();
+        // Row 2 of b.rs (hunk header is 1, first line 2).
+        let row = before.file_row(1) + 2;
+        let anchor = before.anchor(row).unwrap();
+
+        // b.rs got staged: it now lives in the Staged section; a.rs and c.rs stay.
+        let mut after = Review::new(
+            PathBuf::from("/r"),
+            vec![
+                change(Section::Staged, "b.rs"),
+                change(Section::Unstaged, "a.rs"),
+                change(Section::Unstaged, "c.rs"),
+            ],
+        );
+        for file in 0..3 {
+            after.set_loaded(file, text_load("x\ny\nz\n", "x\nY\nz\n"));
+        }
+        after.rebuild_rows();
+        // Gone from Unstaged: land on the next Unstaged file, c.rs.
+        assert_eq!(after.resolve(&anchor), after.file_row(2));
+        // Still present: same offset within the file.
+        let a_anchor = before.anchor(before.file_row(0) + 3).unwrap();
+        assert_eq!(after.resolve(&a_anchor), after.file_row(1) + 3);
+        // Offsets past the end of a shorter file clamp to its last row.
+        let mut far = a_anchor.clone();
+        far.offset = 999;
+        assert_eq!(after.resolve(&far), after.file_row(2) - 1);
+    }
+
+    #[test]
+    fn action_targets_follow_cursor_and_selection() {
+        let mut review = Review::new(PathBuf::from("/r"), vec![change(Section::Unstaged, "a.rs")]);
+        let old: String = (1..=20).map(|i| format!("{i}\n")).collect();
+        let new = old.replace("2\n", "two\n").replace("15\n", "fifteen\n");
+        review.set_loaded(0, text_load(&old, &new));
+        review.rebuild_rows();
+        let rows = review.rows().to_vec();
+        let hunk_rows: Vec<usize> = (0..rows.len())
+            .filter(|&r| matches!(rows[r], Row::Hunk { .. }))
+            .collect();
+        let lines_of = |hunk: usize| -> Vec<usize> {
+            let diff = review.files[0].diff().unwrap();
+            diff.hunks[hunk].lines.clone().collect()
+        };
+        use Target::*;
+        // File header: the whole file.
+        assert_eq!(review.action_target(0, None), Some((0, WholeFile)));
+        // Hunk header, or any line inside a hunk: that hunk.
+        assert_eq!(
+            review.action_target(hunk_rows[1], None),
+            Some((0, Lines(lines_of(1))))
+        );
+        assert_eq!(
+            review.action_target(hunk_rows[0] + 2, None),
+            Some((0, Lines(lines_of(0))))
+        );
+        // A selection: exactly the selected lines, in either direction.
+        let (a, b) = (hunk_rows[0] + 2, hunk_rows[0] + 3);
+        let expected = |r: usize| match rows[r] {
+            Row::Line { line, .. } => line,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            review.action_target(b, Some(a)),
+            Some((0, Lines(vec![expected(a), expected(b)])))
+        );
+        // A selection including the file header is the whole file.
+        assert_eq!(review.action_target(a, Some(0)), Some((0, WholeFile)));
+    }
+
+    #[test]
     fn tree_groups_sections_and_compacts_directories() {
         let review = Review::new(
             PathBuf::from("/r"),
@@ -569,6 +750,16 @@ mod tests {
         );
         review.toggle_dir(Section::Unstaged, "src");
         assert_eq!(review.tree().len(), 3, "{:?}", review.tree());
+        let mut reloaded = Review::new(
+            PathBuf::from("/r"),
+            review.files.iter().map(|f| f.change.clone()).collect(),
+        );
+        reloaded.carry_view_state(&review);
+        assert_eq!(
+            reloaded.tree(),
+            review.tree(),
+            "collapsed state survives a reload"
+        );
         review.toggle_dir(Section::Unstaged, "src");
         assert_eq!(review.tree().len(), 5);
     }

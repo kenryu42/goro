@@ -3,8 +3,9 @@
 A native, instant-open review app for agent-written code changes. See [PRD.md](PRD.md)
 and [ARCHITECTURE.md](ARCHITECTURE.md).
 
-Status: M0. `goro [path]` opens a file tree and a syntax-highlighted diff of the
-working tree (staged, unstaged, untracked). Read-only for now.
+Status: M1. `goro [path]` opens a file tree and a syntax-highlighted diff of the
+working tree (staged, unstaged, untracked). Stage, unstage and discard whole files, hunks
+or selected lines; undo any of them; write the commit in the same window.
 
 ## Develop
 
@@ -13,8 +14,17 @@ cargo run --release -p goro -- [path]   # open a repository (defaults to the cur
 cargo test --workspace                  # core tests against real temp repos, plus headless UI tests
 ```
 
-Keys: `j`/`k` (or arrows) move the cursor, `n`/`p` next/previous hunk, `]`/`[`
-next/previous file, `cmd-q`/`ctrl-q` quit.
+| Key | Action |
+|---|---|
+| `j` `k` (arrows) | move the cursor; with `shift`, select lines |
+| `n` `p` · `]` `[` | next/previous hunk · file |
+| `s` · `S` | stage the hunk, selection or file under the cursor (unstage if staged) · whole file |
+| `x` · `X` | discard it (refused if the file changed since you looked) · whole file |
+| `u` (`cmd-z`) | undo the last stage/unstage/discard |
+| `c` · `cmd-enter` · `esc` | focus the commit message · commit · back to the diff |
+| `cmd-q` / `ctrl-q` | quit |
+
+Header buttons do the same with the mouse; shift-click extends a selection.
 
 Linux build dependencies (Debian/Ubuntu): `libxkbcommon-dev libxkbcommon-x11-dev
 libxcb1-dev libx11-xcb-dev libfontconfig-dev libfreetype-dev libwayland-dev`.

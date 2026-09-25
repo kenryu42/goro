@@ -61,8 +61,17 @@ fn main() {
             new: Source::Worktree,
         })
         .collect();
+    // The review is synthetic; the repository only provides a root for the view.
+    let dir = tempfile::tempdir().unwrap();
+    let status = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let repo = std::sync::Arc::new(goro_core::repo::Repo::discover(dir.path()).unwrap());
     tx.unbounded_send(Event::Opened {
-        root: "/bench".into(),
+        repo,
         changes,
         first: None,
     })

@@ -1,6 +1,7 @@
 //! `goro`: open a review of a repository's working tree.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use clap::Parser;
@@ -65,8 +66,9 @@ fn load_repository(path: PathBuf, tx: UnboundedSender<Event>, startup: Startup) 
         .first()
         .map(|change| load_file(&repo.thread_local(), change));
     startup.mark("first file loaded");
+    let repo = Arc::new(repo);
     let _ = tx.unbounded_send(Event::Opened {
-        root: repo.root().to_path_buf(),
+        repo: repo.clone(),
         changes: changes.clone(),
         first,
     });

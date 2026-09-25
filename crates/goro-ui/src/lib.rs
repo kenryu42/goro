@@ -1,30 +1,37 @@
-//! Goro's window: a file tree beside one continuous, virtualized diff stream.
+//! Goro's window: a file tree and commit box beside one continuous, virtualized diff
+//! stream, with stage / unstage / discard / undo / commit.
 
+mod commit_editor;
+mod diff_rows;
+mod text_buffer;
 mod theme;
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use futures::channel::mpsc::UnboundedReceiver;
 use goro_core::diff::LineKind;
-use goro_core::repo::{FileChange, Section};
-use goro_core::review::{FileLoad, Note, Review, Row, TreeRow, display_line};
-use goro_core::syntax::spans_in;
+use goro_core::git::Git;
+use goro_core::ops::{self, CommitOptions, Selection, Undo};
+use goro_core::repo::{FileChange, Repo, Section};
+use goro_core::review::{FileLoad, Review, Row, Target, TreeRow, load_files};
 use gpui_kit::{
-    App, Bounds, Context, FocusHandle, Focusable, FontWeight, HighlightStyle, KeyBinding,
-    ListHorizontalSizingBehavior, Menu, MenuItem, ScrollStrategy, SharedString, StyledText,
-    TitlebarOptions, UniformListScrollHandle, Window, WindowAppearance, WindowBounds,
-    WindowOptions, actions, div, prelude::*, px, size, uniform_list,
+    App, Bounds, ClickEvent, Context, Entity, FocusHandle, Focusable, FontWeight, KeyBinding,
+    ListHorizontalSizingBehavior, Menu, MenuItem, ScrollStrategy, SharedString, TitlebarOptions,
+    UniformListScrollHandle, Window, WindowAppearance, WindowBounds, WindowOptions, actions, div,
+    prelude::*, px, size, uniform_list,
 };
 
+use commit_editor::{CommitEditor, EditorColors};
 use theme::Theme;
 
 /// Messages from the background loader to the window.
 pub enum Event {
     /// The repository was read. `first` is the first file, loaded before first paint.
     Opened {
-        root: PathBuf,
+        repo: Arc<Repo>,
         changes: Vec<FileChange>,
         first: Option<FileLoad>,
     },
@@ -59,16 +66,31 @@ actions!(
         CloseWindow,
         CursorDown,
         CursorUp,
+        SelectDown,
+        SelectUp,
+        ClearSelection,
         NextHunk,
         PrevHunk,
         NextFile,
-        PrevFile
+        PrevFile,
+        /// Stage the target, or unstage it if it's already staged.
+        Stage,
+        StageFile,
+        Discard,
+        DiscardFile,
+        UndoLast,
+        FocusCommit,
+        FocusDiff,
+        Commit
     ]
 );
 
-const ROW_HEIGHT: f32 = 20.0;
-const SIDEBAR_WIDTH: f32 = 300.0;
-const GUTTER_DIGITS: usize = 5;
+pub(crate) const ROW_HEIGHT: f32 = 20.0;
+const SIDEBAR_WIDTH: f32 = 320.0;
+const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Keys that only apply while the diff (not the commit box) has focus.
+const DIFF_CONTEXT: &str = "Goro && !CommitEditor";
 
 #[cfg(target_os = "macos")]
 const MONO_FONT: &str = "Menlo";
@@ -81,24 +103,46 @@ const MONO_FONT: &str = "DejaVu Sans Mono";
 /// instead of an empty window. Slow repositories open immediately and stream in.
 const OPEN_WAIT: Duration = Duration::from_millis(250);
 
+pub fn bind_keys(cx: &mut App) {
+    let diff = Some(DIFF_CONTEXT);
+    cx.bind_keys([
+        KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("ctrl-q", Quit, None),
+        KeyBinding::new("cmd-w", CloseWindow, None),
+        KeyBinding::new("ctrl-w", CloseWindow, None),
+        KeyBinding::new("j", CursorDown, diff),
+        KeyBinding::new("down", CursorDown, diff),
+        KeyBinding::new("k", CursorUp, diff),
+        KeyBinding::new("up", CursorUp, diff),
+        KeyBinding::new("shift-j", SelectDown, diff),
+        KeyBinding::new("shift-down", SelectDown, diff),
+        KeyBinding::new("shift-k", SelectUp, diff),
+        KeyBinding::new("shift-up", SelectUp, diff),
+        KeyBinding::new("escape", ClearSelection, diff),
+        KeyBinding::new("n", NextHunk, diff),
+        KeyBinding::new("p", PrevHunk, diff),
+        KeyBinding::new("]", NextFile, diff),
+        KeyBinding::new("[", PrevFile, diff),
+        KeyBinding::new("s", Stage, diff),
+        KeyBinding::new("shift-s", StageFile, diff),
+        KeyBinding::new("x", Discard, diff),
+        KeyBinding::new("shift-x", DiscardFile, diff),
+        KeyBinding::new("u", UndoLast, diff),
+        KeyBinding::new("cmd-z", UndoLast, diff),
+        KeyBinding::new("ctrl-z", UndoLast, diff),
+        KeyBinding::new("c", FocusCommit, diff),
+        KeyBinding::new("escape", FocusDiff, Some(commit_editor::CONTEXT)),
+        KeyBinding::new("cmd-enter", Commit, Some("Goro")),
+        KeyBinding::new("ctrl-enter", Commit, Some("Goro")),
+    ]);
+    commit_editor::bind_keys(cx);
+}
+
 pub fn run(startup: Startup, mut events: UnboundedReceiver<Event>) {
     gpui_kit::application().run(move |cx: &mut App| {
         startup.mark("platform ready");
         cx.on_action(|_: &Quit, cx| cx.quit());
-        cx.bind_keys([
-            KeyBinding::new("cmd-q", Quit, None),
-            KeyBinding::new("ctrl-q", Quit, None),
-            KeyBinding::new("cmd-w", CloseWindow, None),
-            KeyBinding::new("ctrl-w", CloseWindow, None),
-            KeyBinding::new("j", CursorDown, Some("Goro")),
-            KeyBinding::new("down", CursorDown, Some("Goro")),
-            KeyBinding::new("k", CursorUp, Some("Goro")),
-            KeyBinding::new("up", CursorUp, Some("Goro")),
-            KeyBinding::new("n", NextHunk, Some("Goro")),
-            KeyBinding::new("p", PrevHunk, Some("Goro")),
-            KeyBinding::new("]", NextFile, Some("Goro")),
-            KeyBinding::new("[", PrevFile, Some("Goro")),
-        ]);
+        bind_keys(cx);
         cx.set_menus([Menu::new("Goro").items([MenuItem::action("Quit Goro", Quit)])]);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
@@ -160,12 +204,38 @@ enum State {
     Failed(String),
 }
 
+/// A review action on the cursor or selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Op {
+    /// Stage, or unstage if already staged.
+    Stage,
+    Discard,
+}
+
+struct Status {
+    text: SharedString,
+    is_error: bool,
+}
+
 pub struct GoroView {
     state: State,
+    repo: Option<Arc<Repo>>,
     cursor: usize,
+    /// Start of a line selection; the selection runs from here to the cursor.
+    select_anchor: Option<usize>,
     diff_scroll: UniformListScrollHandle,
     tree_scroll: UniformListScrollHandle,
     focus_handle: FocusHandle,
+    commit_editor: Entity<CommitEditor>,
+    amend: bool,
+    signoff: bool,
+    undo_stack: Vec<Undo>,
+    /// A git action or commit is running.
+    busy: bool,
+    /// Bumped per reload; stale reload results are dropped.
+    reload_generation: u64,
+    status: Option<Status>,
+    status_generation: u64,
     startup: Startup,
     first_paint_reported: bool,
     /// Forced light/dark; `None` follows the OS.
@@ -202,12 +272,23 @@ impl GoroView {
         .detach();
         cx.observe_window_appearance(window, |_, _, cx| cx.notify())
             .detach();
+        let commit_editor = cx.new(|cx| CommitEditor::new("Commit message", cx));
         let mut view = Self {
             state: State::Loading,
+            repo: None,
             cursor: 0,
+            select_anchor: None,
             diff_scroll: UniformListScrollHandle::new(),
             tree_scroll: UniformListScrollHandle::new(),
             focus_handle: cx.focus_handle(),
+            commit_editor,
+            amend: false,
+            signoff: false,
+            undo_stack: Vec::new(),
+            busy: false,
+            reload_generation: 0,
+            status: None,
+            status_generation: 0,
             startup,
             first_paint_reported: false,
             appearance: None,
@@ -221,15 +302,16 @@ impl GoroView {
         for event in batch {
             match event {
                 Event::Opened {
-                    root,
+                    repo,
                     changes,
                     first,
                 } => {
-                    let mut review = Review::new(root, changes);
+                    let mut review = Review::new(repo.root().to_path_buf(), changes);
                     if let Some(first) = first {
                         review.set_loaded(0, first);
                     }
                     review.rebuild_rows();
+                    self.repo = Some(repo);
                     self.state = State::Ready(review);
                 }
                 Event::Loaded(file, load) => {
@@ -241,31 +323,34 @@ impl GoroView {
                 Event::Failed(message) => self.state = State::Failed(message),
             }
         }
-        if rebuild && let State::Ready(review) = &mut self.state {
-            // Keep the row at the top of the viewport stable while rows are inserted.
-            let top = top_row(&self.diff_scroll);
-            let anchor = review.rows().get(top).copied();
-            let cursor = review.rows().get(self.cursor).copied();
-            review.rebuild_rows();
-            if let Some(ix) = anchor.and_then(|row| find_row(review, row))
-                && ix != top
-            {
-                self.diff_scroll
-                    .scroll_to_item_strict(ix, ScrollStrategy::Top);
-            }
-            self.cursor = cursor
-                .and_then(|row| find_row(review, row))
-                .unwrap_or(self.cursor)
-                .min(review.rows().len().saturating_sub(1));
+        if rebuild {
+            self.rebuild_keeping_position(|review| review.rebuild_rows());
         }
     }
 
-    fn move_cursor(&mut self, to: Option<usize>, strategy: ScrollStrategy, cx: &mut Context<Self>) {
-        if let Some(to) = to {
-            self.cursor = to;
-            self.diff_scroll.scroll_to_item(to, strategy);
-            cx.notify();
+    /// Apply a change to the review while keeping the viewport, cursor and selection on
+    /// the same content.
+    fn rebuild_keeping_position(&mut self, change: impl FnOnce(&mut Review)) {
+        let State::Ready(review) = &mut self.state else {
+            return;
+        };
+        let top = top_row(&self.diff_scroll);
+        let top_anchor = review.anchor(top);
+        let cursor_anchor = review.anchor(self.cursor);
+        let select_anchor = self.select_anchor.and_then(|row| review.anchor(row));
+        change(review);
+        if let Some(anchor) = top_anchor {
+            let ix = review.resolve(&anchor);
+            if ix != top {
+                self.diff_scroll
+                    .scroll_to_item_strict(ix, ScrollStrategy::Top);
+            }
         }
+        self.cursor = cursor_anchor
+            .map(|a| review.resolve(&a))
+            .unwrap_or(0)
+            .min(review.rows().len().saturating_sub(1));
+        self.select_anchor = select_anchor.map(|a| review.resolve(&a));
     }
 
     pub fn review(&self) -> Option<&Review> {
@@ -275,36 +360,406 @@ impl GoroView {
         }
     }
 
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.busy
+    }
+
+    pub fn status_text(&self) -> Option<(&str, bool)> {
+        self.status.as_ref().map(|s| (s.text.as_ref(), s.is_error))
+    }
+
+    pub fn commit_editor(&self) -> &Entity<CommitEditor> {
+        &self.commit_editor
+    }
+
+    /// Force light or dark; `None` follows the OS.
+    pub fn set_appearance(&mut self, appearance: Option<WindowAppearance>, cx: &mut Context<Self>) {
+        self.appearance = appearance;
+        cx.notify();
+    }
+
+    fn theme(&self, window: &Window) -> Theme {
+        Theme::for_appearance(self.appearance.unwrap_or_else(|| window.appearance()))
+    }
+
+    fn git(&self) -> Option<Git> {
+        self.repo.as_ref().map(|repo| Git::new(repo.root()))
+    }
+
+    fn set_status(
+        &mut self,
+        text: impl Into<SharedString>,
+        is_error: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.status = Some(Status {
+            text: text.into(),
+            is_error,
+        });
+        self.status_generation += 1;
+        if !is_error {
+            let generation = self.status_generation;
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(STATUS_TIMEOUT).await;
+                let _ = this.update(cx, |view, cx| {
+                    if view.status_generation == generation {
+                        view.status = None;
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
+    fn move_cursor(
+        &mut self,
+        to: Option<usize>,
+        extend: bool,
+        strategy: ScrollStrategy,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(to) = to else {
+            return;
+        };
+        if extend {
+            self.select_anchor.get_or_insert(self.cursor);
+        } else {
+            self.select_anchor = None;
+        }
+        self.cursor = to;
+        self.diff_scroll.scroll_to_item(to, strategy);
+        cx.notify();
+    }
+
+    fn last_row(&self) -> usize {
+        self.review()
+            .map_or(0, |r| r.rows().len().saturating_sub(1))
+    }
+
     fn cursor_down(&mut self, _: &CursorDown, _: &mut Window, cx: &mut Context<Self>) {
-        let to = self
-            .review()
-            .map(|r| (self.cursor + 1).min(r.rows().len().saturating_sub(1)));
-        self.move_cursor(to, ScrollStrategy::Nearest, cx);
+        let to = (self.cursor + 1).min(self.last_row());
+        self.move_cursor(Some(to), false, ScrollStrategy::Nearest, cx);
     }
 
     fn cursor_up(&mut self, _: &CursorUp, _: &mut Window, cx: &mut Context<Self>) {
-        let to = self.review().map(|_| self.cursor.saturating_sub(1));
-        self.move_cursor(to, ScrollStrategy::Nearest, cx);
+        let to = self.cursor.saturating_sub(1);
+        self.move_cursor(Some(to), false, ScrollStrategy::Nearest, cx);
+    }
+
+    fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
+        let to = (self.cursor + 1).min(self.last_row());
+        self.move_cursor(Some(to), true, ScrollStrategy::Nearest, cx);
+    }
+
+    fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
+        let to = self.cursor.saturating_sub(1);
+        self.move_cursor(Some(to), true, ScrollStrategy::Nearest, cx);
+    }
+
+    /// Escape clears the selection, then a lingering error.
+    fn clear_selection(&mut self, _: &ClearSelection, _: &mut Window, cx: &mut Context<Self>) {
+        if self.select_anchor.take().is_none() {
+            self.status = None;
+        }
+        cx.notify();
     }
 
     fn next_hunk(&mut self, _: &NextHunk, _: &mut Window, cx: &mut Context<Self>) {
         let to = self.review().and_then(|r| r.next_hunk_row(self.cursor));
-        self.move_cursor(to, ScrollStrategy::Top, cx);
+        self.move_cursor(to, false, ScrollStrategy::Top, cx);
     }
 
     fn prev_hunk(&mut self, _: &PrevHunk, _: &mut Window, cx: &mut Context<Self>) {
         let to = self.review().and_then(|r| r.prev_hunk_row(self.cursor));
-        self.move_cursor(to, ScrollStrategy::Top, cx);
+        self.move_cursor(to, false, ScrollStrategy::Top, cx);
     }
 
     fn next_file(&mut self, _: &NextFile, _: &mut Window, cx: &mut Context<Self>) {
         let to = self.review().and_then(|r| r.next_file_row(self.cursor));
-        self.move_cursor(to, ScrollStrategy::Top, cx);
+        self.move_cursor(to, false, ScrollStrategy::Top, cx);
     }
 
     fn prev_file(&mut self, _: &PrevFile, _: &mut Window, cx: &mut Context<Self>) {
         let to = self.review().and_then(|r| r.prev_file_row(self.cursor));
-        self.move_cursor(to, ScrollStrategy::Top, cx);
+        self.move_cursor(to, false, ScrollStrategy::Top, cx);
+    }
+
+    pub(crate) fn click_row(&mut self, row: usize, extend: bool, cx: &mut Context<Self>) {
+        if extend {
+            self.select_anchor.get_or_insert(self.cursor);
+        } else {
+            self.select_anchor = None;
+        }
+        self.cursor = row;
+        cx.notify();
+    }
+
+    pub(crate) fn act_on_row(&mut self, row: usize, op: Op, cx: &mut Context<Self>) {
+        self.cursor = row;
+        self.select_anchor = None;
+        self.run_op(op, false, cx);
+    }
+
+    fn stage(&mut self, _: &Stage, _: &mut Window, cx: &mut Context<Self>) {
+        self.run_op(Op::Stage, false, cx);
+    }
+
+    fn stage_file(&mut self, _: &StageFile, _: &mut Window, cx: &mut Context<Self>) {
+        self.run_op(Op::Stage, true, cx);
+    }
+
+    fn discard(&mut self, _: &Discard, _: &mut Window, cx: &mut Context<Self>) {
+        self.run_op(Op::Discard, false, cx);
+    }
+
+    fn discard_file(&mut self, _: &DiscardFile, _: &mut Window, cx: &mut Context<Self>) {
+        self.run_op(Op::Discard, true, cx);
+    }
+
+    /// Stage/unstage/discard the cursor's target (or the whole file) in the background,
+    /// then reload.
+    fn run_op(&mut self, op: Op, whole_file: bool, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        let (Some(git), Some(review)) = (self.git(), self.review()) else {
+            return;
+        };
+        let Some((file, target)) = review.action_target(self.cursor, self.select_anchor) else {
+            return;
+        };
+        let target = if whole_file {
+            Target::WholeFile
+        } else {
+            target
+        };
+        let entry = review.files[file].clone();
+        let staged = entry.change.section == Section::Staged;
+        let what = match &target {
+            Target::WholeFile => entry.change.path_lossy().into_owned(),
+            Target::Lines(lines) => {
+                let changed = entry.diff().map_or(0, |d| {
+                    lines
+                        .iter()
+                        .filter(|&&ix| d.lines[ix].kind != LineKind::Context)
+                        .count()
+                });
+                format!(
+                    "{changed} line{} of {}",
+                    if changed == 1 { "" } else { "s" },
+                    entry.change.path_lossy()
+                )
+            }
+        };
+        let verb = match (op, staged) {
+            (Op::Stage, false) => "Staged",
+            (Op::Stage, true) => "Unstaged",
+            (Op::Discard, _) => "Discarded",
+        };
+        self.busy = true;
+        cx.notify();
+        let task = cx.background_executor().spawn(async move {
+            let diff = entry.diff().map(|d| &**d);
+            let selection = match &target {
+                Target::WholeFile => Selection::File,
+                Target::Lines(lines) => Selection::Lines(lines),
+            };
+            match (op, staged) {
+                (Op::Stage, false) => ops::stage(&git, &entry.change, diff, selection),
+                (Op::Stage, true) => ops::unstage(&git, &entry.change, diff, selection),
+                (Op::Discard, _) => ops::discard(&git, &entry.change, diff, selection),
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |view, cx| {
+                view.busy = false;
+                match result {
+                    Ok(undo) => {
+                        view.undo_stack.push(undo);
+                        view.select_anchor = None;
+                        view.set_status(format!("{verb} {what}  (u to undo)"), false, cx);
+                        view.reload(cx);
+                    }
+                    Err(err) => view.set_status(err.to_string(), true, cx),
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn undo_last(&mut self, _: &UndoLast, _: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        let Some(git) = self.git() else {
+            return;
+        };
+        let Some(undo) = self.undo_stack.pop() else {
+            self.set_status("Nothing to undo", false, cx);
+            return;
+        };
+        self.busy = true;
+        let task = cx.background_executor().spawn({
+            let undo = undo.clone();
+            async move { ops::undo(&git, &undo) }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |view, cx| {
+                view.busy = false;
+                match result {
+                    Ok(()) => {
+                        view.set_status(format!("Undid {}", undo.description), false, cx);
+                        view.reload(cx);
+                    }
+                    Err(err) => view.set_status(err.to_string(), true, cx),
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Re-read status and every file, then swap the review in place.
+    fn reload(&mut self, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        self.reload_generation += 1;
+        let generation = self.reload_generation;
+        let task = cx.background_executor().spawn(async move {
+            let changes = repo.status().map_err(|e| e.to_string())?;
+            let loads = Mutex::new(Vec::with_capacity(changes.len()));
+            load_files(&repo, &changes, 0..changes.len(), |ix, load| {
+                loads.lock().unwrap().push((ix, load));
+            });
+            Ok::<_, String>((
+                repo.root().to_path_buf(),
+                changes,
+                loads.into_inner().unwrap(),
+            ))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |view, cx| {
+                if view.reload_generation != generation {
+                    return;
+                }
+                match result {
+                    Ok((root, changes, loads)) => view.replace_review(root, changes, loads),
+                    Err(err) => view.set_status(err, true, cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn replace_review(
+        &mut self,
+        root: PathBuf,
+        changes: Vec<FileChange>,
+        loads: Vec<(usize, FileLoad)>,
+    ) {
+        self.rebuild_keeping_position(move |review| {
+            let mut next = Review::new(root, changes);
+            next.carry_view_state(review);
+            for (ix, load) in loads {
+                next.set_loaded(ix, load);
+            }
+            next.rebuild_rows();
+            *review = next;
+        });
+    }
+
+    fn focus_commit(&mut self, _: &FocusCommit, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.commit_editor.focus_handle(cx), cx);
+    }
+
+    fn focus_diff(&mut self, _: &FocusDiff, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus_handle, cx);
+    }
+
+    fn toggle_amend(&mut self, cx: &mut Context<Self>) {
+        self.amend = !self.amend;
+        cx.notify();
+        if !self.amend || !self.commit_editor.read(cx).text().is_empty() {
+            return;
+        }
+        let Some(git) = self.git() else {
+            return;
+        };
+        let task = cx
+            .background_executor()
+            .spawn(async move { ops::last_commit_message(&git) });
+        cx.spawn(async move |this, cx| {
+            if let Ok(message) = task.await {
+                let _ = this.update(cx, |view, cx| {
+                    view.commit_editor
+                        .update(cx, |editor, cx| editor.set_text(&message, cx));
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn staged_count(&self) -> usize {
+        self.review().map_or(0, |r| {
+            r.files
+                .iter()
+                .filter(|f| f.change.section == Section::Staged)
+                .count()
+        })
+    }
+
+    fn commit(&mut self, _: &Commit, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        let Some(git) = self.git() else {
+            return;
+        };
+        if !self.amend && self.staged_count() == 0 {
+            self.set_status("Nothing staged to commit", true, cx);
+            return;
+        }
+        let message = self.commit_editor.read(cx).text().to_string();
+        let options = CommitOptions {
+            amend: self.amend,
+            signoff: self.signoff,
+        };
+        self.busy = true;
+        self.set_status("Committing…", false, cx);
+        let task = cx
+            .background_executor()
+            .spawn(async move { ops::commit(&git, &message, options) });
+        let diff_focus = self.focus_handle.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = this.update_in(cx, |view, window, cx| {
+                view.busy = false;
+                match result {
+                    Ok(summary) => {
+                        view.commit_editor
+                            .update(cx, |editor, cx| editor.set_text("", cx));
+                        view.amend = false;
+                        // Undo entries refer to the old HEAD.
+                        view.undo_stack.clear();
+                        view.set_status(format!("Committed {summary}"), false, cx);
+                        window.focus(&diff_focus, cx);
+                        view.reload(cx);
+                    }
+                    Err(err) => view.set_status(err.to_string(), true, cx),
+                }
+            });
+        })
+        .detach();
     }
 
     fn close_window(&mut self, _: &CloseWindow, window: &mut Window, _: &mut Context<Self>) {
@@ -377,6 +832,85 @@ impl GoroView {
                 .track_scroll(&self.tree_scroll)
                 .flex_1(),
             )
+            .child(self.render_commit_box(theme, cx))
+    }
+
+    fn render_commit_box(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let staged = self.staged_count();
+        let can_commit = !self.busy && (staged > 0 || self.amend);
+        let checkbox = |id: &'static str, label: &'static str, on: bool| {
+            div()
+                .id(id)
+                .flex()
+                .gap_1()
+                .cursor_pointer()
+                .text_color(if on { theme.fg } else { theme.muted })
+                .child(if on { "☑" } else { "☐" })
+                .child(label)
+        };
+        let label = match (self.amend, staged) {
+            (true, _) => "Amend commit".to_string(),
+            (false, 0) => "Nothing staged".to_string(),
+            (false, 1) => "Commit 1 file".to_string(),
+            (false, n) => format!("Commit {n} files"),
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_2()
+            .border_t_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .h(px(ROW_HEIGHT * 5.0 + 8.0))
+                    .p_1()
+                    .rounded_sm()
+                    .bg(theme.bg)
+                    .border_1()
+                    .border_color(theme.border)
+                    .child(self.commit_editor.clone()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        checkbox("amend", "Amend", self.amend).on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_amend(cx)),
+                        ),
+                    )
+                    .child(
+                        checkbox("signoff", "Sign off", self.signoff).on_click(cx.listener(
+                            |this, _: &ClickEvent, _, cx| {
+                                this.signoff = !this.signoff;
+                                cx.notify();
+                            },
+                        )),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("commit")
+                            .px_2()
+                            .rounded_sm()
+                            .when(can_commit, |el| {
+                                el.bg(theme.accent)
+                                    .text_color(gpui_kit::white())
+                                    .cursor_pointer()
+                            })
+                            .when(!can_commit, |el| {
+                                el.border_1()
+                                    .border_color(theme.border)
+                                    .text_color(theme.muted)
+                            })
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.commit(&Commit, window, cx)
+                            }))
+                            .child(label),
+                    ),
+            )
     }
 
     fn render_tree_row(
@@ -435,6 +969,7 @@ impl GoroView {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(row) = this.review().map(|r| r.file_row(file)) {
                             this.cursor = row;
+                            this.select_anchor = None;
                             this.diff_scroll
                                 .scroll_to_item_strict(row, ScrollStrategy::Top);
                             cx.notify();
@@ -447,12 +982,7 @@ impl GoroView {
         }
     }
 
-    fn render_diff(
-        &self,
-        theme: &Theme,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> gpui_kit::AnyElement {
+    fn render_diff(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let review = match &self.state {
             State::Loading => return centered_message("", theme),
             State::Failed(message) => return centered_message(message, theme),
@@ -470,13 +1000,19 @@ impl GoroView {
         let list = uniform_list(
             "diff",
             review.rows().len(),
-            cx.processor(|this, range: std::ops::Range<usize>, window, _cx| {
+            cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
                 let theme = this.theme(window);
                 let Some(review) = this.review() else {
                     return Vec::new();
                 };
+                let selection = this
+                    .select_anchor
+                    .map(|a| a.min(this.cursor)..=a.max(this.cursor));
                 range
-                    .map(|ix| render_diff_row(review, ix, ix == this.cursor, &theme))
+                    .map(|ix| {
+                        let selected = selection.as_ref().is_some_and(|s| s.contains(&ix));
+                        diff_rows::render_row(review, ix, ix == this.cursor, selected, &theme, cx)
+                    })
                     .collect()
             }),
         )
@@ -484,11 +1020,9 @@ impl GoroView {
         .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
         .with_width_from_item(review.widest_row())
         .size_full();
-        let _ = window;
         div()
             .relative()
             .flex_1()
-            .h_full()
             .overflow_hidden()
             .child(list)
             .when_some(sticky, |el, file| {
@@ -498,26 +1032,65 @@ impl GoroView {
                         .top_0()
                         .left_0()
                         .right_0()
-                        .child(file_header(review, file, theme)),
+                        .child(diff_rows::file_header(review, file, None, theme, cx)),
                 )
             })
             .into_any_element()
     }
-}
 
-impl GoroView {
-    pub fn cursor(&self) -> usize {
-        self.cursor
-    }
-
-    /// Force light or dark; `None` follows the OS.
-    pub fn set_appearance(&mut self, appearance: Option<WindowAppearance>, cx: &mut Context<Self>) {
-        self.appearance = appearance;
-        cx.notify();
-    }
-
-    fn theme(&self, window: &Window) -> Theme {
-        Theme::for_appearance(self.appearance.unwrap_or_else(|| window.appearance()))
+    fn render_status_bar(&self, theme: &Theme) -> impl IntoElement {
+        const MAX_ERROR_LINES: usize = 12;
+        let error = self.status.as_ref().filter(|s| s.is_error);
+        let message = self
+            .status
+            .as_ref()
+            .filter(|s| !s.is_error)
+            .map(|s| s.text.clone())
+            .unwrap_or_default();
+        div()
+            .flex()
+            .flex_col()
+            .border_t_1()
+            .border_color(theme.border)
+            .bg(theme.sidebar_bg)
+            .when_some(error, |el, error| {
+                let lines: Vec<&str> = error.text.lines().collect();
+                let hidden = lines.len().saturating_sub(MAX_ERROR_LINES);
+                el.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .px_3()
+                        .py_1()
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .text_color(theme.error)
+                        .children(
+                            lines
+                                .into_iter()
+                                .take(MAX_ERROR_LINES)
+                                .map(|line| div().whitespace_nowrap().child(line.to_string())),
+                        )
+                        .when(hidden > 0, |el| el.child(format!("… {hidden} more lines")))
+                        .child(div().text_color(theme.muted).child("esc to dismiss")),
+                )
+            })
+            .child(
+                div()
+                    .h(px(ROW_HEIGHT + 6.0))
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_3()
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .child(div().flex_1().child(message))
+                    .child(
+                        div()
+                            .text_color(theme.muted)
+                            .child("s stage · x discard · ⇧ select · u undo · c commit"),
+                    ),
+            )
     }
 }
 
@@ -530,23 +1103,44 @@ impl Focusable for GoroView {
 impl Render for GoroView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme(window);
-        if let State::Ready(review) = &self.state {
-            if let Some(name) = review.root.file_name() {
-                window.set_window_title(&format!("{} — Goro", name.to_string_lossy()));
+        match &self.state {
+            State::Ready(review) => {
+                if let Some(name) = review.root.file_name() {
+                    window.set_window_title(&format!("{} — Goro", name.to_string_lossy()));
+                }
+                self.report_first_paint(cx);
             }
-            self.report_first_paint(cx);
-        } else if matches!(self.state, State::Failed(_)) {
-            self.report_first_paint(cx);
+            State::Failed(_) => self.report_first_paint(cx),
+            State::Loading => {}
         }
+        let colors = EditorColors {
+            text: theme.fg,
+            placeholder: theme.muted,
+            cursor: theme.accent,
+            selection: theme.selection_bg,
+        };
+        self.commit_editor
+            .update(cx, |editor, _| editor.set_colors(colors));
         div()
             .key_context("Goro")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::cursor_down))
             .on_action(cx.listener(Self::cursor_up))
+            .on_action(cx.listener(Self::select_down))
+            .on_action(cx.listener(Self::select_up))
+            .on_action(cx.listener(Self::clear_selection))
             .on_action(cx.listener(Self::next_hunk))
             .on_action(cx.listener(Self::prev_hunk))
             .on_action(cx.listener(Self::next_file))
             .on_action(cx.listener(Self::prev_file))
+            .on_action(cx.listener(Self::stage))
+            .on_action(cx.listener(Self::stage_file))
+            .on_action(cx.listener(Self::discard))
+            .on_action(cx.listener(Self::discard_file))
+            .on_action(cx.listener(Self::undo_last))
+            .on_action(cx.listener(Self::focus_commit))
+            .on_action(cx.listener(Self::focus_diff))
+            .on_action(cx.listener(Self::commit))
             .on_action(cx.listener(Self::close_window))
             .flex()
             .flex_row()
@@ -557,7 +1151,15 @@ impl Render for GoroView {
             .text_size(px(12.5))
             .line_height(px(ROW_HEIGHT))
             .child(self.render_sidebar(&theme, cx))
-            .child(self.render_diff(&theme, window, cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .h_full()
+                    .child(self.render_diff(&theme, cx))
+                    .child(self.render_status_bar(&theme)),
+            )
     }
 }
 
@@ -571,20 +1173,11 @@ fn top_row(handle: &UniformListScrollHandle) -> usize {
         .unwrap_or_else(|| state.base_handle.logical_scroll_top().0)
 }
 
-fn find_row(review: &Review, row: Row) -> Option<usize> {
-    let start = review.file_row(row.file());
-    review.rows()[start..]
-        .iter()
-        .take_while(|r| r.file() == row.file())
-        .position(|r| *r == row)
-        .map(|offset| start + offset)
-}
-
 fn indent(depth: usize) -> gpui_kit::Pixels {
     px(12.0 + depth as f32 * 14.0)
 }
 
-fn section_label(section: Section) -> &'static str {
+pub(crate) fn section_label(section: Section) -> &'static str {
     match section {
         Section::Staged => "STAGED",
         Section::Unstaged => "UNSTAGED",
@@ -595,185 +1188,10 @@ fn section_label(section: Section) -> &'static str {
 fn centered_message(message: &str, theme: &Theme) -> gpui_kit::AnyElement {
     div()
         .flex_1()
-        .h_full()
         .flex()
         .items_center()
         .justify_center()
         .text_color(theme.muted)
         .child(SharedString::from(message.to_string()))
         .into_any_element()
-}
-
-fn file_header(review: &Review, file: usize, theme: &Theme) -> gpui_kit::Div {
-    let change = &review.files[file].change;
-    let (badge, color) = theme.status(change.status);
-    let path = match &change.old_path {
-        Some(old) => format!("{old} → {}", change.path),
-        None => change.path_lossy().into_owned(),
-    };
-    div()
-        .h(px(ROW_HEIGHT * 1.5))
-        .w_full()
-        .flex()
-        .items_center()
-        .gap_2()
-        .px_3()
-        .bg(theme.file_header_bg)
-        .border_b_1()
-        .border_t_1()
-        .border_color(theme.border)
-        .whitespace_nowrap()
-        .child(
-            div()
-                .text_color(color)
-                .font_weight(FontWeight::BOLD)
-                .child(badge),
-        )
-        .child(div().font_weight(FontWeight::BOLD).child(path))
-        .child(
-            div()
-                .text_color(theme.muted)
-                .child(section_label(change.section).to_lowercase()),
-        )
-}
-
-fn render_diff_row(
-    review: &Review,
-    ix: usize,
-    is_cursor: bool,
-    theme: &Theme,
-) -> gpui_kit::AnyElement {
-    let row = review.rows()[ix];
-    let el = match row {
-        Row::File { file } => file_header(review, file, theme).h(px(ROW_HEIGHT)),
-        Row::Hunk { file, hunk } => {
-            let diff = review.files[file].diff().expect("hunk rows have diffs");
-            let h = &diff.hunks[hunk];
-            let mut header = format!(
-                "@@ -{},{} +{},{} @@",
-                h.old_start, h.old_len, h.new_start, h.new_len
-            );
-            if let Some(func) = diff.func_context_bytes(h) {
-                header.push(' ');
-                header.push_str(&String::from_utf8_lossy(func));
-            }
-            div()
-                .h(px(ROW_HEIGHT))
-                .w_full()
-                .flex()
-                .items_center()
-                .pl(gutter_width())
-                .bg(theme.hunk_bg)
-                .text_color(theme.hunk_fg)
-                .whitespace_nowrap()
-                .child(header)
-        }
-        Row::Line { file, line } => render_line(review, file, line, theme),
-        Row::Note { note, .. } => div()
-            .h(px(ROW_HEIGHT))
-            .w_full()
-            .flex()
-            .items_center()
-            .pl(gutter_width())
-            .text_color(theme.muted)
-            .whitespace_nowrap()
-            .child(note_text(note)),
-    };
-    // An overlay bar, so the cursor neither shifts content nor recolors row borders.
-    el.relative()
-        .when(is_cursor, |el| {
-            el.child(
-                div()
-                    .absolute()
-                    .left_0()
-                    .top_0()
-                    .bottom_0()
-                    .w(px(3.0))
-                    .bg(theme.accent),
-            )
-        })
-        .into_any_element()
-}
-
-fn gutter_width() -> gpui_kit::Pixels {
-    // Two line-number columns plus the sign column, in monospace cells.
-    px((GUTTER_DIGITS * 2 + 3) as f32 * 7.6)
-}
-
-fn note_text(note: Note) -> String {
-    match note {
-        Note::Loading => "Loading…".into(),
-        Note::Binary { old_len, new_len } => {
-            format!("Binary file changed ({old_len} → {new_len} bytes)")
-        }
-        Note::TooLarge { len } => format!("File too large to diff ({len} bytes)"),
-        Note::Submodule => "Submodule changed".into(),
-        Note::Conflict => "Unresolved merge conflict".into(),
-        Note::NotAFile => "Not a regular file".into(),
-        Note::NoContentChange => "No content changes (mode or rename only)".into(),
-        Note::Failed => "Failed to load this file".into(),
-    }
-}
-
-fn render_line(review: &Review, file: usize, line: usize, theme: &Theme) -> gpui_kit::Div {
-    let entry = &review.files[file];
-    let diff = entry.diff().expect("line rows have diffs");
-    let l = &diff.lines[line];
-    let spans = entry.highlights.as_ref().map(|h| match l.kind {
-        LineKind::Removed => &h.old,
-        _ => &h.new,
-    });
-    let bytes = diff.line_bytes(l);
-    let (text, spans) = display_line(
-        bytes,
-        spans
-            .into_iter()
-            .flat_map(|spans| spans_in(spans, l.content.clone())),
-    );
-    let highlights: Vec<_> = spans
-        .into_iter()
-        .map(|(range, style)| {
-            (
-                range,
-                HighlightStyle {
-                    color: Some(theme.syntax(style)),
-                    ..Default::default()
-                },
-            )
-        })
-        .collect();
-    let (bg, gutter_bg, sign) = match l.kind {
-        LineKind::Context => (None, None, " "),
-        LineKind::Added => (Some(theme.added_bg), Some(theme.added_gutter_bg), "+"),
-        LineKind::Removed => (Some(theme.removed_bg), Some(theme.removed_gutter_bg), "-"),
-    };
-    let number = |n: Option<u32>| {
-        n.map(|n| format!("{n:>width$}", width = GUTTER_DIGITS))
-            .unwrap_or_else(|| " ".repeat(GUTTER_DIGITS))
-    };
-    let gutter = format!("{} {} {sign} ", number(l.old_no), number(l.new_no));
-    let content: SharedString = text.into();
-    let mut content_el = StyledText::new(content);
-    if !highlights.is_empty() {
-        content_el = content_el.with_highlights(highlights);
-    }
-    div()
-        .h(px(ROW_HEIGHT))
-        .w_full()
-        .flex()
-        .flex_row()
-        .whitespace_nowrap()
-        .when_some(bg, |el, bg| el.bg(bg))
-        .child(
-            div()
-                .flex_none()
-                .w(gutter_width())
-                .text_color(theme.muted)
-                .when_some(gutter_bg, |el, bg| el.bg(bg))
-                .child(gutter),
-        )
-        .child(div().pl_1().child(content_el))
-        .when(l.no_newline, |el| {
-            el.child(div().pl_2().text_color(theme.muted).child("⏎̸"))
-        })
 }

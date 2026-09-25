@@ -9,6 +9,7 @@ license.workspace = true
 goro-core.workspace = true
 gpui-kit.workspace = true
 futures.workspace = true
+unicode-segmentation.workspace = true
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }
