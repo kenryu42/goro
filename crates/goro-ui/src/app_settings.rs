@@ -49,7 +49,11 @@ pub fn init(cx: &mut App) {
         let file = path.clone();
         let mut watcher =
             notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-                if event.is_ok_and(|e| e.paths.iter().any(|p| p.file_name() == file.file_name())) {
+                // Only writes: on Linux, reading the file on reload is itself an event.
+                if event.is_ok_and(|e| {
+                    goro_core::watch::is_change(&e.kind)
+                        && e.paths.iter().any(|p| p.file_name() == file.file_name())
+                }) {
                     let _ = tx.unbounded_send(());
                 }
             })

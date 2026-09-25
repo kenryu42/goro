@@ -129,7 +129,9 @@ fn classify(
             // A directory appeared, vanished or was renamed: anything below may differ.
             return Some(Dirty::All);
         }
-        dirty.insert(gix::path::into_bstr(rela).into_owned());
+        dirty.insert(
+            gix::path::to_unix_separators_on_windows(gix::path::into_bstr(rela)).into_owned(),
+        );
     }
     if dirty.is_empty() && !git_state_changed {
         None
@@ -140,7 +142,7 @@ fn classify(
 
 /// Whether an event is a write. Reads must not count: Linux reports opens and reads, and
 /// reloading reads files, which would trigger itself forever.
-fn is_change(kind: &notify::EventKind) -> bool {
+pub fn is_change(kind: &notify::EventKind) -> bool {
     use notify::EventKind;
     use notify::event::{MetadataKind, ModifyKind};
     match kind {
@@ -235,6 +237,8 @@ mod tests {
         std::fs::write(root.join(".gitignore"), "target/\n*.log\n").unwrap();
         std::fs::create_dir_all(root.join("target/debug")).unwrap();
         std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/b.txt"), "b\n").unwrap();
 
         let reports = Arc::new(Mutex::new(Vec::new()));
         let sink = reports.clone();
@@ -253,6 +257,13 @@ mod tests {
 
         std::fs::write(root.join("a.txt"), "changed\n").unwrap();
         assert_eq!(paths(&wait(&reports, Duration::from_secs(3))), ["a.txt"]);
+
+        // Reported with `/`, as git and the review name paths, on every platform.
+        std::fs::write(root.join("src/b.txt"), "changed\n").unwrap();
+        assert_eq!(
+            paths(&wait(&reports, Duration::from_secs(3))),
+            ["src/b.txt"]
+        );
 
         git(&root, &["add", "a.txt"]);
         let reports_after_add = wait(&reports, Duration::from_secs(3));
