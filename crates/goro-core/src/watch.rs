@@ -266,15 +266,19 @@ mod tests {
 
     #[test]
     fn only_writes_count_as_changes() {
-        use notify::event::{AccessKind, CreateKind, MetadataKind, ModifyKind, RemoveKind};
         use notify::EventKind;
+        use notify::event::{AccessKind, CreateKind, MetadataKind, ModifyKind, RemoveKind};
         // Reading a file (Linux reports opens and reads) must not trigger a reload: status
         // itself reads files, which would loop forever.
         assert!(!is_change(&EventKind::Access(AccessKind::Any)));
-        assert!(!is_change(&EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime))));
+        assert!(!is_change(&EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::AccessTime
+        ))));
         assert!(is_change(&EventKind::Create(CreateKind::File)));
         assert!(is_change(&EventKind::Modify(ModifyKind::Any)));
-        assert!(is_change(&EventKind::Modify(ModifyKind::Metadata(MetadataKind::Permissions))));
+        assert!(is_change(&EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::Permissions
+        ))));
         assert!(is_change(&EventKind::Remove(RemoveKind::Any)));
     }
 
