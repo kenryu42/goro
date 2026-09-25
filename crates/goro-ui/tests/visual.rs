@@ -507,13 +507,13 @@ fn switcher_opens_and_dismisses() {
     let root = root_of(&mut cx, window);
     Store::at(dirs.store.path()).touch_recent(&root).unwrap();
     press(&mut cx, window, "ctrl-p");
-    assert!(read(&mut cx, window, |v, _| v.switcher_open()));
+    assert!(read(&mut cx, window, |v, _| v.picker_open()));
     // Typing goes to the switcher's filter, not to the diff's shortcuts.
     let cursor = read(&mut cx, window, |v, _| v.cursor());
     press(&mut cx, window, "j j");
     assert_eq!(read(&mut cx, window, |v, _| v.cursor()), cursor);
     press(&mut cx, window, "escape");
-    assert!(!read(&mut cx, window, |v, _| v.switcher_open()));
+    assert!(!read(&mut cx, window, |v, _| v.picker_open()));
     press(&mut cx, window, "j");
     assert_eq!(
         read(&mut cx, window, |v, _| v.cursor()),
@@ -525,12 +525,186 @@ fn switcher_opens_and_dismisses() {
     press(&mut cx, window, "ctrl-p");
     save_screenshot(&mut cx, window, "review-switcher.png");
     press(&mut cx, window, "enter");
-    assert!(!read(&mut cx, window, |v, _| v.switcher_open()));
+    assert!(!read(&mut cx, window, |v, _| v.picker_open()));
     assert_eq!(
         cx.update(|cx| cx.windows().len()),
         1,
         "no second window for the same repo"
     );
+}
+
+fn comments_are_added_edited_deleted_and_persisted() {
+    let (mut cx, window, dirs) = open(WindowAppearance::Dark);
+    let root = root_of(&mut cx, window);
+    let comments = |cx: &mut HeadlessAppContext| {
+        read(cx, window, |v, _| {
+            v.review()
+                .unwrap()
+                .comments()
+                .iter()
+                .map(|c| (c.location(), c.text.clone()))
+                .collect::<Vec<_>>()
+        })
+    };
+    // src/words.rs: the doc comment's added line.
+    press(&mut cx, window, "] ] ] n j j j j a");
+    press(
+        &mut cx,
+        window,
+        "shift-s a y space c a s e space i s space w r o n g ctrl-enter",
+    );
+    assert_eq!(
+        comments(&mut cx),
+        [(
+            "src/words.rs:3".to_string(),
+            "Say case is wrong".to_string()
+        )]
+    );
+    press(&mut cx, window, "j");
+    let on_comment = read(&mut cx, window, |v, _| {
+        matches!(v.review().unwrap().rows()[v.cursor()], Row::Comment { .. })
+    });
+    assert!(on_comment, "the comment row follows its line");
+    save_screenshot(&mut cx, window, "review-comment.png");
+
+    // Edit it (appending), then check the markdown on the clipboard.
+    press(&mut cx, window, "enter");
+    press(&mut cx, window, "space x ctrl-enter");
+    assert_eq!(comments(&mut cx)[0].1, "Say case is wrong x");
+    press(&mut cx, window, "y");
+    let clipboard = cx
+        .update(|cx| cx.read_from_clipboard())
+        .and_then(|item| item.text())
+        .unwrap_or_default();
+    assert!(
+        clipboard.contains("## src/words.rs:3") && clipboard.contains("Say case is wrong x"),
+        "{clipboard}"
+    );
+
+    // Comments survive reopening.
+    drop(cx);
+    let (mut cx, window) = open_repo(&root, WindowAppearance::Dark, Store::at(dirs.store.path()));
+    assert_eq!(comments(&mut cx).len(), 1);
+    // x on a comment row deletes the comment, not the code.
+    let row = read(&mut cx, window, |v, _| {
+        v.review()
+            .unwrap()
+            .rows()
+            .iter()
+            .position(|r| matches!(r, Row::Comment { .. }))
+            .unwrap()
+    });
+    cx.update_window(window.into(), |view, _, cx| {
+        view.downcast::<GoroView>()
+            .unwrap()
+            .update(cx, |v, cx| v.set_cursor(row, cx));
+    })
+    .unwrap();
+    press(&mut cx, window, "x");
+    assert!(comments(&mut cx).is_empty());
+    assert!(root.join("src/words.rs").exists());
+}
+
+fn sending_a_review_answers_the_waiting_agent() {
+    let (mut cx, window, _dirs) = open(WindowAppearance::Dark);
+    let (tx, mut rx) = futures::channel::oneshot::channel();
+    cx.update_window(window.into(), |view, _, cx| {
+        view.downcast::<GoroView>()
+            .unwrap()
+            .update(cx, |v, cx| v.add_waiter(tx, cx));
+    })
+    .unwrap();
+    press(&mut cx, window, "n j j a");
+    press(&mut cx, window, "f i x ctrl-enter");
+    save_screenshot(&mut cx, window, "review-waiting.png");
+    press(&mut cx, window, "ctrl-shift-enter");
+    let markdown = rx.try_recv().unwrap().expect("review sent");
+    assert!(
+        markdown.contains("# Review comments (1)") && markdown.contains("\nfix\n"),
+        "{markdown}"
+    );
+    assert!(
+        read(&mut cx, window, |v, _| v
+            .review()
+            .unwrap()
+            .comments()
+            .is_empty()),
+        "sent comments are cleared"
+    );
+}
+
+fn turns_are_reviewed_on_their_own() {
+    use goro_core::git::Git;
+    use goro_core::turns::{self, SnapshotMeta, TurnEvent};
+    let (repo_dir, root) = fixture();
+    let git = Git::new(&root);
+    let meta = |event, at_ms| SnapshotMeta {
+        agent: "claude".into(),
+        event,
+        session_id: "session-1".into(),
+        turn_id: None,
+        prompt: Some("Handle empty input".into()),
+        at_ms,
+    };
+    // A turn that only touches web/app.ts, on top of the fixture's other changes.
+    let now = SnapshotMeta::now_ms();
+    turns::snapshot(&git, &meta(TurnEvent::Start, now - 60_000)).unwrap();
+    std::fs::write(root.join("web/app.ts"), "export function greet(name: string): string {\n  return name ? `Hello, ${name}!` : \"Hello!\";\n}\n").unwrap();
+    turns::snapshot(&git, &meta(TurnEvent::End, now - 30_000)).unwrap();
+
+    let store = tempfile::tempdir().unwrap();
+    let (mut cx, window) = open_repo(&root, WindowAppearance::Dark, Store::at(store.path()));
+    wait_until(
+        &mut cx,
+        window,
+        std::time::Duration::from_secs(5),
+        "sessions",
+        |v, _| v.session_count() == 1,
+    );
+    press(&mut cx, window, "<");
+    wait_until(
+        &mut cx,
+        window,
+        std::time::Duration::from_secs(5),
+        "the turn's diff",
+        |v, _| {
+            v.review()
+                .unwrap()
+                .files
+                .iter()
+                .all(|f| f.change.section == goro_core::repo::Section::Snapshot)
+                && !v.review().unwrap().files.is_empty()
+        },
+    );
+    let files = read(&mut cx, window, |v, _| {
+        v.review()
+            .unwrap()
+            .files
+            .iter()
+            .map(|f| f.change.path_lossy().into_owned())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(files, ["web/app.ts"], "only what the turn changed");
+    save_screenshot(&mut cx, window, "review-turn.png");
+
+    press(&mut cx, window, "n s");
+    let status = read(&mut cx, window, |v, _| {
+        v.status_text().map(|(t, _)| t.to_string())
+    });
+    assert!(
+        status.unwrap_or_default().contains("read-only"),
+        "turn changes can't be staged"
+    );
+
+    press(&mut cx, window, "w");
+    wait_until(
+        &mut cx,
+        window,
+        std::time::Duration::from_secs(5),
+        "the working tree",
+        |v, _| v.review().unwrap().files.len() == 5,
+    );
+    drop(repo_dir);
 }
 
 fn main() {
@@ -545,7 +719,7 @@ fn main() {
         std::env::set_var("CODEX_HOME", isolated.path().join("codex"));
         std::env::set_var("GORO_DATA_DIR", isolated.path().join("goro"));
     }
-    let tests: [(&str, fn()); 10] = [
+    let tests: [(&str, fn()); 13] = [
         (
             "renders_every_file_in_one_stream",
             renders_every_file_in_one_stream,
@@ -574,6 +748,18 @@ fn main() {
             reviewed_marks_collapse_and_persist,
         ),
         ("switcher_opens_and_dismisses", switcher_opens_and_dismisses),
+        (
+            "comments_are_added_edited_deleted_and_persisted",
+            comments_are_added_edited_deleted_and_persisted,
+        ),
+        (
+            "sending_a_review_answers_the_waiting_agent",
+            sending_a_review_answers_the_waiting_agent,
+        ),
+        (
+            "turns_are_reviewed_on_their_own",
+            turns_are_reviewed_on_their_own,
+        ),
     ];
     for (name, test) in tests {
         test();

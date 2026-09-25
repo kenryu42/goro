@@ -152,15 +152,15 @@ Goro stores its state as ordinary git objects under `refs/goro/`, so it's gc-saf
 portable with the repo, and removable with `goro clean`:
 
 ```
-refs/goro/turns/<session>/<n>       turn snapshots (commit; message = prompt metadata)
+refs/goro/turns/<session>/<ms>-<ev> turn snapshots (commit; message = JSON metadata)
 refs/goro/undo                      chain of commits holding pre-discard content (raw blobs)
 refs/goro/undo-previous             the previous undo generation
 ```
 
 Retention: undo history keeps two generations of up to 200 discards each; when
 `refs/goro/undo` fills up it becomes `undo-previous` (dropping the generation before) and
-a new chain starts, so nothing is ever rewritten. Turn snapshots (M3) will be pruned by
-age and count on launch. Refs under `refs/goro/` show up in `git log --all`; that trade-off is
+a new chain starts, so nothing is ever rewritten. Turn snapshots are pruned to the newest
+400 by the hook worker. Refs under `refs/goro/` show up in `git log --all`; that trade-off is
 documented, and it's how GitButler and others persist state too.
 
 Non-git state lives in the platform data dir (`goro_core::store`, via `dirs`:
@@ -223,17 +223,36 @@ window already showing that repository or opens a new one. From a terminal, the 
 instance re-launches itself detached (`GORO_NO_DETACH` marks the child) so the shell gets
 its prompt back.
 
-**Hooks:**
-- Claude Code: `UserPromptSubmit` → snapshot "turn start"; `Stop` → snapshot "turn end" and
-  nudge the app. Hook payload (`session_id`, `cwd`, `prompt`, `transcript_path`) is stored
-  in the turn commit's message, which is the anchor for v2 intent linking.
-- Codex: the `notify` turn-complete program (plus richer hooks if available when M3
-  starts; verify then).
-- `goro hook` must finish in ≤ 50 ms, exit 0 on any internal error, and write errors only
-  to Goro's log file, never to the agent's output.
+**Hooks (`goro_core::hooks`, `goro hooks install`):**
+- Claude Code (`$CLAUDE_CONFIG_DIR/settings.json` or `~/.claude/settings.json`) and Codex
+  (`$CODEX_HOME/hooks.json` or `~/.codex/hooks.json`) both get `UserPromptSubmit` →
+  `goro hook <agent> prompt` and `Stop` → `goro hook <agent> stop` (timeout 5 s). Installing
+  keeps other settings, hooks and key order; Goro's entries are recognized by their command
+  (neither agent has hook ids), so reinstalling replaces them and uninstalling restores the
+  file. The CLI shows the planned edits and asks first (`--yes` for scripts).
+- Codex only runs hooks the user has trusted (`/hooks`); Goro never writes trust entries.
+  Codex's single `notify` slot is left alone (it's often taken).
+- `goro hook` reads the payload, hands it to a detached `goro hook-worker` (stdin pipe),
+  and exits 0 without output: a prompt hook's stdout would reach the model. Measured ≈
+  7–12 ms warm. Errors go to `goro.log` in the data dir.
+- The worker snapshots the worktree (`goro_core::turns`: temp index seeded from the real
+  one, `git add -A`, `write-tree`, `commit-tree`) to
+  `refs/goro/turns/<session>/<unix ms>-<start|end>`, metadata (agent, session, turn id,
+  prompt) as JSON in the message; prunes to the newest 400 snapshots; records the repo in
+  `activity.json` (auto-detect prefers it); and tells a running Goro over IPC (`turn`).
+- Turns pair start/end per session (by Codex's `turn_id`, else in order). A turn's view
+  diffs its start tree to its end tree (or to a fresh worktree tree while it runs); a
+  session's view diffs its first snapshot to the worktree now. Both use `git diff-tree`
+  and show read-only `Snapshot` changes.
 
-**Blocking review (`--wait`):** the CLI registers a waiter over IPC; submitting the review
-in the app sends back the markdown and the CLI prints it to stdout and exits 0.
+**Comments and `--wait`:** comments (`goro_core::comments`) anchor to a path, side and
+line range, keep the diff excerpt they were written on, persist per repository, and
+export as markdown. `goro --wait` sends `wait` over IPC (starting Goro if needed) and
+blocks; Send review (⌘⇧↵) answers every waiter with the markdown and clears the
+comments; closing the window answers `cancelled` (exit 1).
+
+**IPC verbs:** `open`, `turn`, `wait` (see `goro/src/ipc.rs`). `GORO_SOCKET_ID` isolates
+tests and development builds from an installed Goro.
 
 ## Rendering the diff
 

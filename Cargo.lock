@@ -3196,6 +3196,8 @@ dependencies = [
  "goro-core",
  "goro-ui",
  "interprocess",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

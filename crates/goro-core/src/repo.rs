@@ -42,6 +42,8 @@ pub enum Section {
     Unstaged,
     /// Not tracked by git and not ignored.
     Untracked,
+    /// Between two snapshots (an agent turn); read-only.
+    Snapshot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

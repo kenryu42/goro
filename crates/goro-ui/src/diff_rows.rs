@@ -73,6 +73,27 @@ pub(crate) fn render_row(
                 .children(action_buttons(section, ix, "hunk", theme, cx))
         }
         Row::Line { file, line } => render_line(review, file, line, ix, theme),
+        Row::Comment { comment, line, .. } => {
+            let c = &review.comments()[comment];
+            let text = c.text.lines().nth(line).unwrap_or_default().to_string();
+            div()
+                .id(("row", ix))
+                .h(px(ROW_HEIGHT))
+                .w_full()
+                .flex()
+                .items_center()
+                .pl(gutter_width())
+                .bg(theme.comment_bg)
+                .whitespace_nowrap()
+                .child(
+                    div()
+                        .w(px(24.0))
+                        .flex_none()
+                        .text_color(theme.accent)
+                        .child(if line == 0 { "💬" } else { "" }),
+                )
+                .child(text)
+        }
         Row::Note { note, .. } => div()
             .id(("row", ix))
             .h(px(ROW_HEIGHT))
@@ -171,6 +192,10 @@ fn action_buttons(
     theme: &Theme,
     cx: &mut Context<GoroView>,
 ) -> Vec<AnyElement> {
+    // A turn's snapshots are read-only.
+    if section == Section::Snapshot {
+        return Vec::new();
+    }
     let stage_label = if section == Section::Staged {
         "Unstage"
     } else {

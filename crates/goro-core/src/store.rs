@@ -9,6 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::comments::Comment;
+
 /// How many recent repositories to remember.
 const RECENT_LIMIT: usize = 50;
 
@@ -34,6 +36,9 @@ pub struct RepoState {
     pub seen: Option<HashMap<String, HashSet<u64>>>,
     /// Hashes of hunks marked reviewed.
     pub reviewed: HashSet<u64>,
+    /// Review comments not yet sent to an agent.
+    #[serde(default)]
+    pub comments: Vec<Comment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,22 +85,50 @@ impl Store {
         read_json(&self.dir.join("recent.json")).unwrap_or_default()
     }
 
-    pub fn touch_recent(&self, root: &Path) -> std::io::Result<()> {
-        let mut recent = self.recent();
-        recent.retain(|r| r.root != root);
+    /// Repositories agents worked in (recorded by hooks), most recent first.
+    pub fn activity(&self) -> Vec<RecentRepo> {
+        read_json(&self.dir.join("activity.json")).unwrap_or_default()
+    }
+
+    pub fn touch_activity(&self, root: &Path) -> std::io::Result<()> {
+        touch(&self.dir.join("activity.json"), root)
+    }
+
+    /// Append a line to Goro's log (errors that must not reach an agent's output).
+    pub fn append_log(&self, message: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        std::fs::create_dir_all(&self.dir)?;
+        let mut log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.dir.join("goro.log"))?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        recent.insert(
-            0,
-            RecentRepo {
-                root: root.to_path_buf(),
-                opened_at: now,
-            },
-        );
-        recent.truncate(RECENT_LIMIT);
-        write_json(&self.dir.join("recent.json"), &recent)
+        writeln!(log, "{now} {message}")
     }
+
+    pub fn touch_recent(&self, root: &Path) -> std::io::Result<()> {
+        touch(&self.dir.join("recent.json"), root)
+    }
+}
+
+/// Move `root` to the front of the most-recent-first list in `file`.
+fn touch(file: &Path, root: &Path) -> std::io::Result<()> {
+    let mut recent: Vec<RecentRepo> = read_json(file).unwrap_or_default();
+    recent.retain(|r| r.root != root);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    recent.insert(
+        0,
+        RecentRepo {
+            root: root.to_path_buf(),
+            opened_at: now,
+        },
+    );
+    recent.truncate(RECENT_LIMIT);
+    write_json(file, &recent)
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
@@ -143,6 +176,7 @@ mod tests {
                 HashSet::from([1, 2]),
             )])),
             reviewed: HashSet::from([42]),
+            comments: Vec::new(),
         };
         store.save_repo_state(a, &state).unwrap();
         assert_eq!(store.repo_state(a), state);

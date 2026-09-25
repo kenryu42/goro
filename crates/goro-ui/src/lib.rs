@@ -2,7 +2,7 @@
 //! continuous, virtualized diff stream.
 
 mod diff_rows;
-mod switcher;
+mod picker;
 mod text_buffer;
 mod text_editor;
 mod theme;
@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
+use futures::channel::oneshot;
 use goro_core::detect::{AgentLogs, detect_repo};
 use goro_core::repo::{FileChange, Repo};
 use goro_core::review::{FileLoad, load_file, load_files};
@@ -38,6 +39,16 @@ pub enum Event {
     /// No repository was given and none could be detected.
     NoRepository,
     Failed(String),
+}
+
+/// Requests from other `goro` invocations and agent hooks.
+pub enum AppRequest {
+    /// Open (or focus) a repository; `None` detects one.
+    Open(Option<PathBuf>),
+    /// Open the repository and hand the submitted review (markdown) to `reply`.
+    Wait(Option<PathBuf>, oneshot::Sender<String>),
+    /// An agent hook recorded a turn in this repository.
+    TurnRecorded(PathBuf),
 }
 
 /// Startup timing. `GORO_TRACE_STARTUP=1` prints each phase to stderr.
@@ -90,7 +101,23 @@ actions!(
         FocusCommit,
         FocusDiff,
         Commit,
-        OpenSwitcher
+        OpenSwitcher,
+        /// Pick a turn (or session) to review on its own.
+        OpenTimeline,
+        /// Back to the working tree.
+        ShowWorkingTree,
+        PrevTurn,
+        NextTurn,
+        /// Comment on the line, hunk or selection under the cursor.
+        AddComment,
+        /// Edit the comment under the cursor.
+        EditComment,
+        SaveComment,
+        CancelComment,
+        /// Copy all comments as markdown.
+        CopyComments,
+        /// Send the comments to the agent waiting on `goro --wait`.
+        SendReview
     ]
 );
 
@@ -108,8 +135,20 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-q", Quit, None),
         KeyBinding::new("cmd-w", CloseWindow, None),
         KeyBinding::new("ctrl-w", CloseWindow, None),
-        KeyBinding::new("cmd-p", OpenSwitcher, Some("Goro && !Switcher")),
-        KeyBinding::new("ctrl-p", OpenSwitcher, Some("Goro && !Switcher")),
+        KeyBinding::new("cmd-p", OpenSwitcher, Some("Goro && !Picker")),
+        KeyBinding::new("ctrl-p", OpenSwitcher, Some("Goro && !Picker")),
+        KeyBinding::new("t", OpenTimeline, diff),
+        KeyBinding::new("w", ShowWorkingTree, diff),
+        KeyBinding::new("<", PrevTurn, diff),
+        KeyBinding::new(">", NextTurn, diff),
+        KeyBinding::new("a", AddComment, diff),
+        KeyBinding::new("enter", EditComment, diff),
+        KeyBinding::new("y", CopyComments, diff),
+        KeyBinding::new("cmd-shift-enter", SendReview, Some("Goro")),
+        KeyBinding::new("ctrl-shift-enter", SendReview, Some("Goro")),
+        KeyBinding::new("cmd-enter", SaveComment, Some("CommentBox")),
+        KeyBinding::new("ctrl-enter", SaveComment, Some("CommentBox")),
+        KeyBinding::new("escape", CancelComment, Some("CommentBox > TextEditor")),
         KeyBinding::new("j", CursorDown, diff),
         KeyBinding::new("down", CursorDown, diff),
         KeyBinding::new("k", CursorUp, diff),
@@ -136,11 +175,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-z", UndoLast, diff),
         KeyBinding::new("c", FocusCommit, diff),
         KeyBinding::new("escape", FocusDiff, Some("CommitBox > TextEditor")),
-        KeyBinding::new("cmd-enter", Commit, Some("Goro && !Switcher")),
-        KeyBinding::new("ctrl-enter", Commit, Some("Goro && !Switcher")),
+        KeyBinding::new("cmd-enter", Commit, Some("Goro && !Picker && !CommentBox")),
+        KeyBinding::new("ctrl-enter", Commit, Some("Goro && !Picker && !CommentBox")),
     ]);
     text_editor::bind_keys(cx);
-    switcher::bind_keys(cx);
+    picker::bind_keys(cx);
 }
 
 /// Load a repository on a background thread: `target`, or the detected one when `None`.
@@ -166,7 +205,8 @@ fn load_repository(
 ) {
     let target = target.or_else(|| {
         let recent = store.as_ref().map(Store::recent).unwrap_or_default();
-        let detected = detect_repo(&AgentLogs::default_locations(), &recent);
+        let hooked = store.as_ref().map(Store::activity).unwrap_or_default();
+        let detected = detect_repo(&AgentLogs::default_locations(), &hooked, &recent);
         startup.mark("repo detected");
         detected
     });
@@ -219,7 +259,7 @@ fn load_repository(
 pub fn run(
     startup: Startup,
     mut first: UnboundedReceiver<Event>,
-    mut opens: UnboundedReceiver<Option<PathBuf>>,
+    mut requests: UnboundedReceiver<AppRequest>,
     store: Option<Store>,
 ) {
     gpui_kit::application().run(move |cx: &mut App| {
@@ -237,13 +277,13 @@ pub fn run(
 
         let initial = wait_for_open(&mut first, startup.t0 + OPEN_WAIT);
         startup.mark("review ready for first frame");
-        open_window(startup, initial, first, cx);
+        let _ = open_window(startup, initial, first, cx);
         startup.mark("window opened");
         cx.activate(true);
 
         cx.spawn(async move |cx| {
-            while let Some(target) = opens.next().await {
-                cx.update(|cx| open_repo(target, cx));
+            while let Some(request) = requests.next().await {
+                cx.update(|cx| handle_request(request, cx));
             }
         })
         .detach();
@@ -257,14 +297,31 @@ fn app_store(cx: &App) -> Option<Store> {
     cx.try_global::<AppStore>().and_then(|s| s.0.clone())
 }
 
+pub fn handle_request(request: AppRequest, cx: &mut App) {
+    match request {
+        AppRequest::Open(target) => {
+            open_repo(target, cx);
+        }
+        AppRequest::Wait(target, reply) => {
+            let window = open_repo(target, cx);
+            let _ = window.update(cx, |view, _, cx| view.add_waiter(reply, cx));
+        }
+        AppRequest::TurnRecorded(root) => {
+            if let Some(window) = window_for(&root, cx) {
+                let _ = window.update(cx, |view, _, cx| view.load_sessions(cx));
+            }
+        }
+    }
+}
+
 /// Focus the window already showing `target`'s repository, or open a new one.
-pub fn open_repo(target: Option<PathBuf>, cx: &mut App) {
+pub fn open_repo(target: Option<PathBuf>, cx: &mut App) -> WindowHandle<GoroView> {
     if let Some(target) = &target
         && let Some(window) = window_for(target, cx)
     {
         let _ = window.update(cx, |_, window, _| window.activate_window());
         cx.activate(true);
-        return;
+        return window;
     }
     let startup = Startup {
         t0: Instant::now(),
@@ -272,8 +329,9 @@ pub fn open_repo(target: Option<PathBuf>, cx: &mut App) {
         bench_exit: false,
     };
     let events = spawn_loader(target, app_store(cx), startup);
-    open_window(startup, Vec::new(), events, cx);
+    let window = open_window(startup, Vec::new(), events, cx);
     cx.activate(true);
+    window
 }
 
 fn window_for(target: &Path, cx: &App) -> Option<WindowHandle<GoroView>> {
@@ -290,7 +348,7 @@ fn open_window(
     initial: Vec<Event>,
     events: UnboundedReceiver<Event>,
     cx: &mut App,
-) {
+) -> WindowHandle<GoroView> {
     let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
     let store = app_store(cx);
     cx.open_window(
@@ -309,7 +367,7 @@ fn open_window(
             view
         },
     )
-    .expect("failed to open window");
+    .expect("failed to open window")
 }
 
 /// Collect events until the repository is opened (or failed), or `deadline` passes.

@@ -84,6 +84,7 @@ impl Fixture {
                 self.git_raw(&["diff", "--no-color", "--no-index", "/dev/null", &path])
                     .stdout
             }
+            Section::Snapshot => unreachable!("status never reports snapshot changes"),
         };
         match out.windows(3).position(|w| w == b"\n@@") {
             Some(pos) => out[pos + 1..].to_vec(),

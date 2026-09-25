@@ -69,12 +69,25 @@ pub fn agent_activity(logs: &AgentLogs) -> Vec<AgentActivity> {
     activity
 }
 
-/// The repository to open: the newest agent activity inside a repository, else the most
-/// recently opened repository that still exists.
-pub fn detect_repo(logs: &AgentLogs, recent: &[RecentRepo]) -> Option<PathBuf> {
-    agent_activity(logs)
+/// The repository to open: where a Goro hook last recorded a turn, else the newest agent
+/// activity in the session logs, else the most recently opened repository that still
+/// exists.
+pub fn detect_repo(
+    logs: &AgentLogs,
+    hooked: &[RecentRepo],
+    recent: &[RecentRepo],
+) -> Option<PathBuf> {
+    let hooked_at = hooked.first().map(|h| h.opened_at);
+    let mut logged = agent_activity(logs);
+    // Session logs newer than the latest hook win (hooks may not be installed everywhere).
+    if let Some(at) = hooked_at {
+        let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(at);
+        logged.retain(|a| a.at > at);
+    }
+    logged
         .into_iter()
         .map(|a| a.cwd)
+        .chain(hooked.iter().map(|r| r.root.clone()))
         .chain(recent.iter().map(|r| r.root.clone()))
         .find_map(|dir| {
             // Directories in old logs may be gone; start from the nearest one that exists.
@@ -241,7 +254,7 @@ mod tests {
         assert_eq!(activity.len(), 2);
         assert_eq!(activity[0].cwd, claude_repo.join("src"));
         // A subdirectory resolves to its repository root.
-        assert_eq!(detect_repo(&logs, &[]), Some(claude_repo.clone()));
+        assert_eq!(detect_repo(&logs, &[], &[]), Some(claude_repo.clone()));
 
         // Codex becomes the most recent.
         touch(
@@ -252,7 +265,7 @@ mod tests {
             ),
             3_000,
         );
-        assert_eq!(detect_repo(&logs, &[]), Some(codex_repo));
+        assert_eq!(detect_repo(&logs, &[], &[]), Some(codex_repo));
     }
 
     #[test]
@@ -284,8 +297,38 @@ mod tests {
                 opened_at: 1,
             },
         ];
-        assert_eq!(detect_repo(&logs, &recent), Some(repo));
-        assert_eq!(detect_repo(&AgentLogs::default(), &[]), None);
+        assert_eq!(detect_repo(&logs, &[], &recent), Some(repo));
+        assert_eq!(detect_repo(&AgentLogs::default(), &[], &[]), None);
+    }
+
+    #[test]
+    fn a_newer_hook_record_beats_older_session_logs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (logged, hooked) = (root.join("logged"), root.join("hooked"));
+        init_repo(&logged);
+        init_repo(&hooked);
+        let logs = AgentLogs {
+            claude_projects: Some(root.join("claude/projects")),
+            codex_sessions: None,
+        };
+        touch(
+            &root.join("claude/projects/-x/s.jsonl"),
+            &format!(
+                "{{\"cwd\":{}}}\n",
+                serde_json::to_string(logged.to_str().unwrap()).unwrap()
+            ),
+            1_000,
+        );
+        let hook = |at| RecentRepo {
+            root: hooked.clone(),
+            opened_at: at,
+        };
+        assert_eq!(
+            detect_repo(&logs, &[hook(2_000)], &[]),
+            Some(hooked.clone())
+        );
+        assert_eq!(detect_repo(&logs, &[hook(500)], &[]), Some(logged));
     }
 
     #[test]

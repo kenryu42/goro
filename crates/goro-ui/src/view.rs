@@ -21,10 +21,13 @@ use gpui_kit::{
 };
 
 use crate::diff_rows;
-use crate::switcher::Switcher;
+use crate::picker::{Picker, PickerEvent, PickerItem};
 use crate::text_editor::{EditorColors, TextEditor};
 use crate::theme::Theme;
 use crate::*;
+use futures::channel::oneshot;
+use goro_core::comments::{Comment, to_markdown};
+use goro_core::turns::{self, Session};
 
 pub(crate) const ROW_HEIGHT: f32 = 20.0;
 const SIDEBAR_WIDTH: f32 = 320.0;
@@ -38,6 +41,31 @@ const MONO_FONT: &str = "Menlo";
 const MONO_FONT: &str = "Consolas";
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 const MONO_FONT: &str = "DejaVu Sans Mono";
+
+/// What the diff compares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Mode {
+    /// HEAD, index and worktree: staged, unstaged and untracked changes.
+    WorkingTree,
+    /// One agent turn: its start snapshot to its end (or the worktree while it runs).
+    Turn { session: String, turn: usize },
+    /// A whole session: its first snapshot to the worktree now.
+    Session { session: String },
+}
+
+enum PickerPurpose {
+    Repos(Vec<PathBuf>),
+    Turns(Vec<Mode>),
+}
+
+struct Draft {
+    editor: Entity<TextEditor>,
+    /// The comment being edited, or a new one on these lines of `file`.
+    editing: Option<u64>,
+    file: usize,
+    lines: Vec<usize>,
+    location: String,
+}
 
 enum State {
     Loading,
@@ -84,7 +112,15 @@ pub struct GoroView {
     baseline_pending: bool,
     /// When the window last became active (for "last look").
     active_since: Option<Instant>,
-    switcher: Option<Entity<Switcher>>,
+    picker: Option<(Entity<Picker>, PickerPurpose)>,
+    /// What the diff compares.
+    mode: Mode,
+    /// Recorded agent sessions (from turn snapshots), most recent first.
+    sessions: Vec<Session>,
+    /// A comment being written or edited.
+    draft: Option<Draft>,
+    /// `goro --wait` callers waiting for this review.
+    waiters: Vec<oneshot::Sender<String>>,
     status: Option<Status>,
     status_generation: u64,
     startup: Startup,
@@ -148,7 +184,11 @@ impl GoroView {
             reload_in_flight: false,
             baseline_pending: false,
             active_since: None,
-            switcher: None,
+            picker: None,
+            mode: Mode::WorkingTree,
+            sessions: Vec::new(),
+            draft: None,
+            waiters: Vec::new(),
             status: None,
             status_generation: 0,
             startup,
@@ -176,10 +216,12 @@ impl GoroView {
                     self.baseline_pending = state.seen.is_none();
                     review.set_seen(state.seen);
                     review.set_reviewed(state.reviewed);
+                    review.set_comments(state.comments);
                     review.rebuild_rows();
                     self.repo = Some(repo);
                     self.state = State::Ready(Box::new(review));
                     self.start_watching(cx);
+                    self.load_sessions(cx);
                 }
                 Event::NoRepository => self.state = State::NoRepository,
                 Event::Loaded(file, load) => {
@@ -384,7 +426,9 @@ impl GoroView {
     }
 
     fn discard(&mut self, _: &Discard, _: &mut Window, cx: &mut Context<Self>) {
-        self.run_op(Op::Discard, false, cx);
+        if !self.delete_comment_at_cursor(cx) {
+            self.run_op(Op::Discard, false, cx);
+        }
     }
 
     fn discard_file(&mut self, _: &DiscardFile, _: &mut Window, cx: &mut Context<Self>) {
@@ -520,9 +564,26 @@ impl GoroView {
             return;
         };
         let previous = review.files.clone();
+        let trees = match self.comparison_trees() {
+            Ok(trees) => trees,
+            Err(err) => {
+                self.set_status(err, true, cx);
+                return;
+            }
+        };
         self.reload_in_flight = true;
         let task = cx.background_executor().spawn(async move {
-            let changes = repo.status().map_err(|e| e.to_string())?;
+            let changes = match trees {
+                None => repo.status().map_err(|e| e.to_string())?,
+                Some((old, new)) => {
+                    let git = Git::new(repo.root());
+                    let new = match new {
+                        Some(tree) => tree,
+                        None => turns::worktree_tree(&git).map_err(|e| e.to_string())?,
+                    };
+                    turns::changes_between(&git, &old, &new).map_err(|e| e.to_string())?
+                }
+            };
             let mut loads = reuse_loads(&previous, &changes, &dirty);
             let missing: Vec<usize> = (0..changes.len())
                 .filter(|&ix| loads[ix].is_none())
@@ -555,6 +616,433 @@ impl GoroView {
             });
         })
         .detach();
+    }
+
+    /// For turn and session modes: the tree to compare from, and the tree to compare to
+    /// (`None`: the worktree now). `None` for the working tree.
+    fn comparison_trees(&self) -> Result<Option<(String, Option<String>)>, String> {
+        let session_of = |id: &str| {
+            self.sessions
+                .iter()
+                .find(|s| s.id == id)
+                .ok_or_else(|| "that session's snapshots are gone".to_string())
+        };
+        match &self.mode {
+            Mode::WorkingTree => Ok(None),
+            Mode::Turn { session, turn } => {
+                let turn = session_of(session)?
+                    .turns
+                    .get(*turn)
+                    .ok_or("that turn's snapshots are gone")?;
+                let old = turn
+                    .start
+                    .as_ref()
+                    .or(turn.end.as_ref())
+                    .ok_or("that turn has no snapshots")?;
+                Ok(Some((
+                    old.tree.clone(),
+                    turn.end.as_ref().map(|e| e.tree.clone()),
+                )))
+            }
+            Mode::Session { session } => {
+                let first = session_of(session)?
+                    .turns
+                    .iter()
+                    .find_map(|t| t.start.as_ref().or(t.end.as_ref()))
+                    .ok_or("that session has no snapshots")?;
+                Ok(Some((first.tree.clone(), None)))
+            }
+        }
+    }
+
+    /// Re-read recorded agent sessions (after a hook records a turn).
+    pub fn load_sessions(&mut self, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        let task = cx
+            .background_executor()
+            .spawn(async move { turns::list(&Git::new(repo.root())) });
+        cx.spawn(async move |this, cx| {
+            if let Ok(sessions) = task.await {
+                let _ = this.update(cx, |view, cx| {
+                    view.sessions = sessions;
+                    // A running turn or session view compares against a new snapshot.
+                    if view.mode != Mode::WorkingTree {
+                        view.request_reload(Dirty::All, cx);
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub fn mode(&self) -> &Mode {
+        &self.mode
+    }
+
+    fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
+        if self.mode == mode {
+            return;
+        }
+        self.mode = mode;
+        self.cursor = 0;
+        self.select_anchor = None;
+        self.diff_scroll
+            .scroll_to_item_strict(0, ScrollStrategy::Top);
+        self.request_reload(Dirty::All, cx);
+        cx.notify();
+    }
+
+    fn show_working_tree(&mut self, _: &ShowWorkingTree, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_mode(Mode::WorkingTree, cx);
+    }
+
+    /// Turns in timeline order (oldest first) across the current session.
+    fn step_turn(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let (session, turn) = match &self.mode {
+            Mode::Turn { session, turn } => (session.clone(), *turn as isize + delta),
+            // From the working tree or a session view, `<` goes to the latest turn.
+            _ => match self.sessions.first() {
+                Some(s) if !s.turns.is_empty() => (s.id.clone(), s.turns.len() as isize - 1),
+                _ => {
+                    self.set_status(
+                        "No agent turns recorded yet (goro hooks install)",
+                        false,
+                        cx,
+                    );
+                    return;
+                }
+            },
+        };
+        let count = self
+            .sessions
+            .iter()
+            .find(|s| s.id == session)
+            .map_or(0, |s| s.turns.len()) as isize;
+        if (0..count).contains(&turn) {
+            self.set_mode(
+                Mode::Turn {
+                    session,
+                    turn: turn as usize,
+                },
+                cx,
+            );
+        }
+    }
+
+    fn prev_turn(&mut self, _: &PrevTurn, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_turn(-1, cx);
+    }
+
+    fn next_turn(&mut self, _: &NextTurn, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_turn(1, cx);
+    }
+
+    fn open_timeline(&mut self, _: &OpenTimeline, window: &mut Window, cx: &mut Context<Self>) {
+        let mut items = vec![PickerItem {
+            title: "Working tree".into(),
+            detail: "staged, unstaged and untracked changes".into(),
+            ..Default::default()
+        }];
+        let mut modes = vec![Mode::WorkingTree];
+        for session in &self.sessions {
+            let short: String = session.id.chars().take(8).collect();
+            items.push(PickerItem {
+                title: format!("Whole session ({} turns)", session.turns.len()),
+                detail: format!("{} · session {short}", session.agent),
+                tag: None,
+                note: Some(time_label(session.last_at_ms)),
+            });
+            modes.push(Mode::Session {
+                session: session.id.clone(),
+            });
+            for (ix, turn) in session.turns.iter().enumerate().rev() {
+                let at = turn
+                    .start
+                    .as_ref()
+                    .or(turn.end.as_ref())
+                    .map_or(0, |s| s.meta.at_ms);
+                items.push(PickerItem {
+                    title: format!("  Turn {}", ix + 1),
+                    detail: turn
+                        .prompt
+                        .as_deref()
+                        .map(first_line)
+                        .unwrap_or_else(|| "(no prompt recorded)".into()),
+                    tag: turn.end.is_none().then(|| "running".into()),
+                    note: Some(time_label(at)),
+                });
+                modes.push(Mode::Turn {
+                    session: session.id.clone(),
+                    turn: ix,
+                });
+            }
+        }
+        if self.sessions.is_empty() {
+            self.set_status(
+                "No agent turns recorded yet: run `goro hooks install`, then let an agent work",
+                false,
+                cx,
+            );
+        }
+        self.show_picker(
+            "Review a turn…",
+            items,
+            PickerPurpose::Turns(modes),
+            window,
+            cx,
+        );
+    }
+
+    fn show_picker(
+        &mut self,
+        placeholder: &str,
+        items: Vec<PickerItem>,
+        purpose: PickerPurpose,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<Picker> {
+        let appearance = self.appearance;
+        let picker = cx.new(|cx| Picker::new(placeholder, items, appearance, cx));
+        cx.subscribe_in(
+            &picker,
+            window,
+            |this, _, event: &PickerEvent, window, cx| {
+                let Some((_, purpose)) = this.picker.take() else {
+                    return;
+                };
+                window.focus(&this.focus_handle, cx);
+                match (event, purpose) {
+                    (PickerEvent::Pick(ix), PickerPurpose::Repos(roots)) => {
+                        if let Some(root) = roots.get(*ix).cloned() {
+                            // After this update: `open_repo` reads every window, including this one.
+                            cx.defer(move |cx| {
+                                crate::open_repo(Some(root), cx);
+                            });
+                        }
+                    }
+                    (PickerEvent::Typed(text), PickerPurpose::Repos(_)) => {
+                        let path = PathBuf::from(text);
+                        if path.is_dir() {
+                            cx.defer(move |cx| {
+                                crate::open_repo(Some(path), cx);
+                            });
+                        }
+                    }
+                    (PickerEvent::Pick(ix), PickerPurpose::Turns(modes)) => {
+                        if let Some(mode) = modes.get(*ix).cloned() {
+                            this.set_mode(mode, cx);
+                        }
+                    }
+                    _ => {}
+                }
+                cx.notify();
+            },
+        )
+        .detach();
+        window.focus(&picker.focus_handle(cx), cx);
+        self.picker = Some((picker.clone(), purpose));
+        cx.notify();
+        picker
+    }
+
+    /// Lines a new comment covers: the selection, else the line (or hunk) at the cursor.
+    fn comment_target(&self) -> Option<(usize, Vec<usize>)> {
+        let review = self.review()?;
+        if self.select_anchor.is_none()
+            && let Some(Row::Line { file, line }) = review.rows().get(self.cursor)
+        {
+            return Some((*file, vec![*line]));
+        }
+        match review.action_target(self.cursor, self.select_anchor)? {
+            (file, Target::Lines(lines)) => Some((file, lines)),
+            (_, Target::WholeFile) => None,
+        }
+    }
+
+    fn add_comment(&mut self, _: &AddComment, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((file, lines)) = self.comment_target() else {
+            self.set_status(
+                "Put the cursor on a line (or select lines) to comment",
+                false,
+                cx,
+            );
+            return;
+        };
+        let review = self.review().expect("a target implies a review");
+        let path = review.files[file].change.path_lossy().into_owned();
+        let Some(diff) = review.files[file].diff() else {
+            return;
+        };
+        let location = Comment::on_lines(0, &path, diff, &lines, String::new())
+            .map(|c| c.location())
+            .unwrap_or(path);
+        self.open_draft(None, file, lines, location, "", window, cx);
+    }
+
+    fn edit_comment(&mut self, _: &EditComment, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(review) = self.review() else {
+            return;
+        };
+        let Some(Row::Comment { file, comment, .. }) = review.rows().get(self.cursor).copied()
+        else {
+            return;
+        };
+        let comment = review.comments()[comment].clone();
+        self.open_draft(
+            Some(comment.id),
+            file,
+            Vec::new(),
+            comment.location(),
+            &comment.text,
+            window,
+            cx,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_draft(
+        &mut self,
+        editing: Option<u64>,
+        file: usize,
+        lines: Vec<usize>,
+        location: String,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor = cx.new(|cx| {
+            let mut editor = TextEditor::new("What should change here?", cx);
+            editor.set_text(text, cx);
+            editor
+        });
+        window.focus(&editor.focus_handle(cx), cx);
+        self.draft = Some(Draft {
+            editor,
+            editing,
+            file,
+            lines,
+            location,
+        });
+        cx.notify();
+    }
+
+    fn save_comment(&mut self, _: &SaveComment, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(draft) = self.draft.take() else {
+            return;
+        };
+        window.focus(&self.focus_handle, cx);
+        let text = draft.editor.read(cx).text().trim().to_string();
+        let State::Ready(review) = &mut self.state else {
+            return;
+        };
+        let mut comments = review.comments().to_vec();
+        match draft.editing {
+            Some(id) if text.is_empty() => comments.retain(|c| c.id != id),
+            Some(id) => {
+                if let Some(c) = comments.iter_mut().find(|c| c.id == id) {
+                    c.text = text;
+                }
+            }
+            None if text.is_empty() => {}
+            None => {
+                let id = comments.iter().map(|c| c.id).max().unwrap_or(0) + 1;
+                let entry = &review.files[draft.file];
+                if let Some(diff) = entry.diff()
+                    && let Some(comment) =
+                        Comment::on_lines(id, &entry.change.path_lossy(), diff, &draft.lines, text)
+                {
+                    comments.push(comment);
+                }
+            }
+        }
+        self.rebuild_keeping_position(move |review| {
+            review.set_comments(comments);
+            review.rebuild_rows();
+        });
+        self.save_state(cx);
+        cx.notify();
+    }
+
+    fn cancel_comment(&mut self, _: &CancelComment, window: &mut Window, cx: &mut Context<Self>) {
+        self.draft = None;
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    /// Delete the comment under the cursor. Returns whether there was one.
+    fn delete_comment_at_cursor(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(Row::Comment { comment, .. }) = self
+            .review()
+            .and_then(|r| r.rows().get(self.cursor).copied())
+        else {
+            return false;
+        };
+        let State::Ready(review) = &mut self.state else {
+            return false;
+        };
+        let mut comments = review.comments().to_vec();
+        comments.remove(comment);
+        self.rebuild_keeping_position(move |review| {
+            review.set_comments(comments);
+            review.rebuild_rows();
+        });
+        self.save_state(cx);
+        self.set_status("Comment deleted", false, cx);
+        true
+    }
+
+    fn copy_comments(&mut self, _: &CopyComments, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(review) = self.review() else {
+            return;
+        };
+        let count = review.comments().len();
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(to_markdown(
+            review.comments(),
+        )));
+        self.set_status(format!("Copied {count} comment(s) as markdown"), false, cx);
+    }
+
+    pub fn add_waiter(&mut self, reply: oneshot::Sender<String>, cx: &mut Context<Self>) {
+        self.waiters.push(reply);
+        self.set_status(
+            "An agent is waiting for your review: ⌘⇧↵ sends your comments",
+            false,
+            cx,
+        );
+        cx.notify();
+    }
+
+    pub fn is_waited_on(&self) -> bool {
+        self.waiters.iter().any(|w| !w.is_canceled())
+    }
+
+    fn send_review(&mut self, _: &SendReview, _: &mut Window, cx: &mut Context<Self>) {
+        self.waiters.retain(|w| !w.is_canceled());
+        if self.waiters.is_empty() {
+            self.set_status(
+                "No agent is waiting (`goro --wait`); press y to copy comments",
+                false,
+                cx,
+            );
+            return;
+        }
+        let Some(review) = self.review() else {
+            return;
+        };
+        let markdown = to_markdown(review.comments());
+        let count = review.comments().len();
+        for waiter in self.waiters.drain(..) {
+            let _ = waiter.send(markdown.clone());
+        }
+        self.rebuild_keeping_position(|review| {
+            review.set_comments(Vec::new());
+            review.rebuild_rows();
+        });
+        self.save_state(cx);
+        self.set_status(format!("Sent {count} comment(s) to the agent"), false, cx);
     }
 
     fn replace_review(&mut self, root: PathBuf, changes: Vec<FileChange>, loads: Vec<FileLoad>) {
@@ -615,6 +1103,10 @@ impl GoroView {
 
     /// Everything shown now counts as seen.
     fn mark_seen(&mut self, cx: &mut Context<Self>) {
+        // A look at a turn's snapshots isn't a look at the working tree.
+        if self.mode != Mode::WorkingTree {
+            return;
+        }
         if let State::Ready(review) = &mut self.state {
             let seen = review.snapshot_seen();
             review.set_seen(Some(seen));
@@ -644,6 +1136,7 @@ impl GoroView {
         let state = RepoState {
             seen: review.seen().cloned(),
             reviewed: review.reviewed_for_save(),
+            comments: review.comments().to_vec(),
         };
         cx.background_executor()
             .spawn(async move {
@@ -689,32 +1182,107 @@ impl GoroView {
     }
 
     fn open_switcher(&mut self, _: &OpenSwitcher, window: &mut Window, cx: &mut Context<Self>) {
-        let recent = self.store.as_ref().map(Store::recent).unwrap_or_default();
+        let recent: Vec<PathBuf> = self
+            .store
+            .as_ref()
+            .map(Store::recent)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| r.root)
+            .filter(|root| root.is_dir())
+            .collect();
         let current = self.root().map(Path::to_path_buf);
-        let appearance = self.appearance;
-        let switcher = cx.new(|cx| Switcher::new(recent, current, appearance, window, cx));
-        cx.subscribe_in(
-            &switcher,
+        let item = move |root: &PathBuf, agent: bool| PickerItem {
+            title: root
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| root.to_string_lossy().into_owned()),
+            detail: root.to_string_lossy().into_owned(),
+            tag: agent.then(|| "agent".into()),
+            note: (current.as_ref() == Some(root)).then(|| "open".into()),
+        };
+        let items = recent.iter().map(|r| item(r, false)).collect();
+        let picker = self.show_picker(
+            "Open repository…",
+            items,
+            PickerPurpose::Repos(recent.clone()),
             window,
-            |this, _, event: &crate::switcher::SwitcherEvent, window, cx| {
-                this.switcher = None;
-                window.focus(&this.focus_handle, cx);
-                if let crate::switcher::SwitcherEvent::Open(path) = event {
-                    // After this update: `open_repo` reads every window, including this one.
-                    let path = path.clone();
-                    cx.defer(move |cx| crate::open_repo(Some(path), cx));
+            cx,
+        );
+        // Agent-active repositories and change counts arrive from a background scan.
+        let task = cx.background_executor().spawn(async move {
+            let mut roots: Vec<(PathBuf, bool)> = Vec::new();
+            for activity in goro_core::detect::agent_activity(
+                &goro_core::detect::AgentLogs::default_locations(),
+            ) {
+                let Some(dir) = activity.cwd.ancestors().find(|d| d.is_dir()) else {
+                    continue;
+                };
+                if let Ok(repo) = Repo::discover(dir) {
+                    let root = repo.root().to_path_buf();
+                    if !roots.iter().any(|(r, _)| *r == root) {
+                        roots.push((root, true));
+                    }
                 }
-                cx.notify();
-            },
-        )
+            }
+            for root in recent {
+                if !roots.iter().any(|(r, _)| *r == root) {
+                    roots.push((root, false));
+                }
+            }
+            roots
+                .into_iter()
+                .map(|(root, agent)| {
+                    let count = Repo::discover(&root)
+                        .and_then(|r| r.status())
+                        .ok()
+                        .map(|c| c.len());
+                    (root, agent, count)
+                })
+                .collect::<Vec<_>>()
+        });
+        cx.spawn(async move |this, cx| {
+            let scanned = task.await;
+            let _ = this.update(cx, |view, cx| {
+                let Some((current_picker, PickerPurpose::Repos(roots))) = &mut view.picker else {
+                    return;
+                };
+                if *current_picker != picker {
+                    return;
+                }
+                *roots = scanned.iter().map(|(r, _, _)| r.clone()).collect();
+                let items = scanned
+                    .iter()
+                    .map(|(root, agent, count)| {
+                        let mut i = item(root, *agent);
+                        if i.note.is_none() {
+                            i.note = count.map(|n| match n {
+                                0 => "clean".to_string(),
+                                1 => "1 change".to_string(),
+                                n => format!("{n} changes"),
+                            });
+                        }
+                        i
+                    })
+                    .collect();
+                picker.update(cx, |p, cx| p.set_items(items, cx));
+            });
+        })
         .detach();
-        window.focus(&switcher.focus_handle(cx), cx);
-        self.switcher = Some(switcher);
+    }
+
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
+    }
+
+    pub fn set_cursor(&mut self, row: usize, cx: &mut Context<Self>) {
+        self.cursor = row;
+        self.select_anchor = None;
         cx.notify();
     }
 
-    pub fn switcher_open(&self) -> bool {
-        self.switcher.is_some()
+    pub fn picker_open(&self) -> bool {
+        self.picker.is_some()
     }
 
     pub fn root(&self) -> Option<&Path> {
@@ -965,6 +1533,7 @@ impl GoroView {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> gpui_kit::AnyElement {
+        let show_new = self.mode == Mode::WorkingTree;
         let row = div()
             .id(("tree-row", ix))
             .w_full()
@@ -1030,7 +1599,7 @@ impl GoroView {
                     .when(review.file_is_reviewed(file), |el| {
                         el.child(div().text_color(theme.muted).child("✓"))
                     })
-                    .when(review.file_new_count(file) > 0, |el| {
+                    .when(show_new && review.file_new_count(file) > 0, |el| {
                         el.child(
                             div()
                                 .text_color(theme.new_marker)
@@ -1080,7 +1649,7 @@ impl GoroView {
                         let flags = diff_rows::RowFlags {
                             is_cursor: ix == this.cursor,
                             is_selected: selected,
-                            is_new: review.is_new(ix),
+                            is_new: this.mode == Mode::WorkingTree && review.is_new(ix),
                         };
                         diff_rows::render_row(review, ix, flags, &theme, cx)
                     })
@@ -1109,9 +1678,145 @@ impl GoroView {
             .into_any_element()
     }
 
+    fn render_wait_banner(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui_kit::AnyElement> {
+        if !self.is_waited_on() {
+            return None;
+        }
+        let count = self.review().map_or(0, |r| r.comments().len());
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .px_3()
+                .py_1()
+                .bg(theme.hunk_bg)
+                .border_b_1()
+                .border_color(theme.border)
+                .child(div().flex_1().child(format!(
+                    "An agent is waiting for your review · {count} comment(s)"
+                )))
+                .child(diff_rows::button(
+                    "send-review",
+                    "Send review ⌘⇧↵",
+                    theme,
+                    cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.send_review(&SendReview, window, cx)
+                    }),
+                ))
+                .into_any_element(),
+        )
+    }
+
+    fn render_mode_bar(&self, theme: &Theme) -> Option<gpui_kit::AnyElement> {
+        let (title, detail) = match &self.mode {
+            Mode::WorkingTree => return None,
+            Mode::Turn { session, turn } => {
+                let s = self.sessions.iter().find(|s| &s.id == session)?;
+                let t = s.turns.get(*turn)?;
+                let at = t
+                    .start
+                    .as_ref()
+                    .or(t.end.as_ref())
+                    .map_or(0, |x| x.meta.at_ms);
+                (
+                    format!("Turn {} of {} · {}", turn + 1, s.turns.len(), s.agent),
+                    format!(
+                        "“{}” · {}{}",
+                        t.prompt.as_deref().map(first_line).unwrap_or_default(),
+                        time_label(at),
+                        if t.end.is_none() { " · running" } else { "" }
+                    ),
+                )
+            }
+            Mode::Session { session } => {
+                let s = self.sessions.iter().find(|s| &s.id == session)?;
+                (
+                    format!("Whole session · {} turns · {}", s.turns.len(), s.agent),
+                    format!("start of session → now · {}", time_label(s.last_at_ms)),
+                )
+            }
+        };
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .px_3()
+                .py_1()
+                .bg(theme.file_header_bg)
+                .border_b_1()
+                .border_color(theme.border)
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .child(div().font_weight(FontWeight::BOLD).child(title))
+                .child(div().flex_1().text_color(theme.muted).child(detail))
+                .child(
+                    div()
+                        .text_color(theme.muted)
+                        .child("< > turns · t timeline · w working tree"),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_draft(&self, theme: &Theme) -> Option<gpui_kit::AnyElement> {
+        let draft = self.draft.as_ref()?;
+        let editor = draft.editor.clone();
+        Some(
+            div()
+                .key_context("CommentBox")
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_2()
+                .border_t_1()
+                .border_color(theme.border)
+                .bg(theme.sidebar_bg)
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(div().font_weight(FontWeight::BOLD).child(format!(
+                            "{} comment on {}",
+                            if draft.editing.is_some() {
+                                "Edit"
+                            } else {
+                                "New"
+                            },
+                            draft.location
+                        )))
+                        .child(
+                            div()
+                                .text_color(theme.muted)
+                                .child("⌘↵ save · esc cancel · empty deletes"),
+                        ),
+                )
+                .child(
+                    div()
+                        .h(px(ROW_HEIGHT * 4.0 + 8.0))
+                        .p_1()
+                        .rounded_sm()
+                        .bg(theme.bg)
+                        .border_1()
+                        .border_color(theme.border)
+                        .child(editor),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_status_bar(&self, theme: &Theme) -> impl IntoElement {
         const MAX_ERROR_LINES: usize = 12;
-        let new_count = self.review().map_or(0, Review::new_count);
+        // "New since last look" is about the working tree, not a turn's snapshots.
+        let new_count = match self.mode {
+            Mode::WorkingTree => self.review().map_or(0, Review::new_count),
+            _ => 0,
+        };
         let error = self.status.as_ref().filter(|s| s.is_error);
         let message = self
             .status
@@ -1200,6 +1905,11 @@ impl Render for GoroView {
         };
         self.commit_editor
             .update(cx, |editor, _| editor.set_colors(colors));
+        if let Some(draft) = &self.draft {
+            draft
+                .editor
+                .update(cx, |editor, _| editor.set_colors(colors));
+        }
         div()
             .key_context("Goro")
             .track_focus(&self.focus_handle)
@@ -1226,6 +1936,16 @@ impl Render for GoroView {
             .on_action(cx.listener(Self::mark_seen_action))
             .on_action(cx.listener(Self::toggle_reviewed))
             .on_action(cx.listener(Self::open_switcher))
+            .on_action(cx.listener(Self::show_working_tree))
+            .on_action(cx.listener(Self::open_timeline))
+            .on_action(cx.listener(Self::prev_turn))
+            .on_action(cx.listener(Self::next_turn))
+            .on_action(cx.listener(Self::add_comment))
+            .on_action(cx.listener(Self::edit_comment))
+            .on_action(cx.listener(Self::save_comment))
+            .on_action(cx.listener(Self::cancel_comment))
+            .on_action(cx.listener(Self::copy_comments))
+            .on_action(cx.listener(Self::send_review))
             .relative()
             .flex()
             .flex_row()
@@ -1241,22 +1961,32 @@ impl Render for GoroView {
                     .flex()
                     .flex_col()
                     .flex_1()
+                    // Don't grow to the widest diff line; the list scrolls horizontally.
+                    .min_w(px(0.0))
                     .h_full()
+                    .when_some(self.render_wait_banner(&theme, cx), |el, banner| {
+                        el.child(banner)
+                    })
+                    .when_some(self.render_mode_bar(&theme), |el, bar| el.child(bar))
                     .child(self.render_diff(&theme, cx))
+                    .when_some(self.render_draft(&theme), |el, draft| el.child(draft))
                     .child(self.render_status_bar(&theme)),
             )
-            .when_some(self.switcher.clone(), |el, switcher| {
-                el.child(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .flex()
-                        .justify_center()
-                        .items_start()
-                        .pt(px(80.0))
-                        .child(switcher),
-                )
-            })
+            .when_some(
+                self.picker.as_ref().map(|(p, _)| p.clone()),
+                |el, switcher| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .justify_center()
+                            .items_start()
+                            .pt(px(80.0))
+                            .child(switcher),
+                    )
+                },
+            )
     }
 }
 
@@ -1281,6 +2011,7 @@ pub(crate) fn section_label(section: Section) -> &'static str {
         Section::Staged => "STAGED",
         Section::Unstaged => "UNSTAGED",
         Section::Untracked => "UNTRACKED",
+        Section::Snapshot => "CHANGES",
     }
 }
 
@@ -1293,4 +2024,25 @@ fn centered_message(message: &str, theme: &Theme) -> gpui_kit::AnyElement {
         .text_color(theme.muted)
         .child(SharedString::from(message.to_string()))
         .into_any_element()
+}
+
+/// "3m ago"-style label for a Unix time in milliseconds.
+pub(crate) fn time_label(at_ms: u64) -> String {
+    let now = goro_core::turns::SnapshotMeta::now_ms();
+    let secs = now.saturating_sub(at_ms) / 1000;
+    match secs {
+        0..60 => "just now".into(),
+        60..3600 => format!("{}m ago", secs / 60),
+        3600..86_400 => format!("{}h ago", secs / 3600),
+        _ => format!("{}d ago", secs / 86_400),
+    }
+}
+
+fn first_line(text: &str) -> String {
+    let line = text.lines().next().unwrap_or_default().trim();
+    if line.chars().count() > 80 {
+        format!("{}…", line.chars().take(80).collect::<String>())
+    } else {
+        line.to_string()
+    }
 }

@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use gix::bstr::ByteSlice;
 
+use crate::comments::{Comment, Side};
 use crate::diff::{FileDiff, LineKind};
 use crate::repo::{FileChange, Loaded, Repo, Section, ThreadRepo};
 use crate::store::stable_hash;
@@ -192,10 +193,27 @@ pub enum Note {
 /// One row of the diff stream. Rows are uniform height so the list can be virtualized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Row {
-    File { file: usize },
-    Hunk { file: usize, hunk: usize },
-    Line { file: usize, line: usize },
-    Note { file: usize, note: Note },
+    File {
+        file: usize,
+    },
+    Hunk {
+        file: usize,
+        hunk: usize,
+    },
+    Line {
+        file: usize,
+        line: usize,
+    },
+    Note {
+        file: usize,
+        note: Note,
+    },
+    /// Line `line` of a comment's text (index into [`Review::comments`]).
+    Comment {
+        file: usize,
+        comment: usize,
+        line: usize,
+    },
 }
 
 impl Row {
@@ -204,7 +222,8 @@ impl Row {
             Row::File { file }
             | Row::Hunk { file, .. }
             | Row::Line { file, .. }
-            | Row::Note { file, .. } => file,
+            | Row::Note { file, .. }
+            | Row::Comment { file, .. } => file,
         }
     }
 }
@@ -265,6 +284,7 @@ pub struct Review {
     reviewed: HashSet<u64>,
     /// Per file, the hash of each hunk (computed on rebuild).
     hunk_hashes: Vec<Vec<u64>>,
+    comments: Vec<Comment>,
 }
 
 /// Changed-line hashes per path, as of the last look.
@@ -318,6 +338,7 @@ impl Review {
             new_per_file: Vec::new(),
             reviewed: HashSet::new(),
             hunk_hashes: Vec::new(),
+            comments: Vec::new(),
         };
         review.rebuild_rows();
         review.rebuild_tree();
@@ -381,6 +402,9 @@ impl Review {
                 .map(|d| d.hunks[hunk].lines.clone().collect())
                 .unwrap_or_default()
         };
+        if matches!(self.rows[cursor], Row::Comment { .. }) {
+            return None;
+        }
         let target = match anchor {
             Some(anchor) => {
                 let range = anchor.min(cursor)..=anchor.max(cursor);
@@ -401,6 +425,7 @@ impl Review {
             }
             None => match self.rows[cursor] {
                 Row::File { .. } | Row::Note { .. } => Target::WholeFile,
+                Row::Comment { .. } => return None,
                 Row::Hunk { hunk, .. } => Target::Lines(hunk_lines(hunk)),
                 Row::Line { line, .. } => {
                     let diff = self.files[file].diff()?;
@@ -473,6 +498,7 @@ impl Review {
                 None => Vec::new(),
             })
             .collect();
+        let mut placed = HashSet::new();
         for (file, entry) in self.files.iter().enumerate() {
             let seen = self
                 .seen
@@ -517,6 +543,21 @@ impl Review {
                                 self.new_per_file[file] += 1;
                             }
                             self.rows.push(Row::Line { file, line });
+                            let anchor = match l.kind {
+                                LineKind::Removed => (Side::Old, l.old_no),
+                                _ => (Side::New, l.new_no),
+                            };
+                            if let (side, Some(number)) = anchor {
+                                for (ix, comment) in self.comments.iter().enumerate() {
+                                    if comment.side == side
+                                        && comment.end == number
+                                        && comment.path.as_bytes() == entry.change.path.as_slice()
+                                        && placed.insert(ix)
+                                    {
+                                        push_comment_rows(&mut self.rows, file, ix, comment);
+                                    }
+                                }
+                            }
                         }
                     }
                     None
@@ -525,7 +566,29 @@ impl Review {
             if let Some(note) = note {
                 self.rows.push(Row::Note { file, note });
             }
+            // Comments whose line is no longer in the diff go at the end of their file,
+            // under the file's last section.
+            let last_of_path = !self.files[file + 1..]
+                .iter()
+                .any(|f| f.change.path == entry.change.path);
+            if last_of_path {
+                for (ix, comment) in self.comments.iter().enumerate() {
+                    if comment.path.as_bytes() == entry.change.path.as_slice() && placed.insert(ix)
+                    {
+                        push_comment_rows(&mut self.rows, file, ix, comment);
+                    }
+                }
+            }
         }
+    }
+
+    /// Set review comments. Call [`Review::rebuild_rows`] after.
+    pub fn set_comments(&mut self, comments: Vec<Comment>) {
+        self.comments = comments;
+    }
+
+    pub fn comments(&self) -> &[Comment] {
+        &self.comments
     }
 
     /// Set what the user saw at their last look. Call [`Review::rebuild_rows`] after.
@@ -612,7 +675,9 @@ impl Review {
                 .and_then(|d| d.hunks.iter().position(|h| h.lines.contains(&line)))
                 .into_iter()
                 .collect(),
-            Row::File { .. } | Row::Note { .. } => (0..self.hunk_hashes[file].len()).collect(),
+            Row::File { .. } | Row::Note { .. } | Row::Comment { .. } => {
+                (0..self.hunk_hashes[file].len()).collect()
+            }
         };
         let mark = !hunks.iter().all(|&h| self.hunk_is_reviewed(file, h));
         for h in hunks {
@@ -639,6 +704,7 @@ impl Review {
     /// Keep view state (collapsed directories) from the review this one replaces.
     pub fn carry_view_state(&mut self, previous: &Review) {
         self.collapsed = previous.collapsed.clone();
+        self.comments = previous.comments.clone();
         self.seen = previous.seen.clone();
         self.reviewed = previous.reviewed.clone();
         self.rebuild_tree();
@@ -734,6 +800,15 @@ fn build_tree_level(
             }
         }
     }
+}
+
+fn push_comment_rows(rows: &mut Vec<Row>, file: usize, comment: usize, c: &Comment) {
+    let lines = c.text.lines().count().max(1);
+    rows.extend((0..lines).map(|line| Row::Comment {
+        file,
+        comment,
+        line,
+    }));
 }
 
 /// Tab stop width used when rendering code.
@@ -1093,6 +1168,76 @@ mod tests {
         assert_eq!(d, Dirty::All);
         d.merge(paths(&["c"]));
         assert_eq!(d, Dirty::All);
+    }
+
+    #[test]
+    fn comment_rows_follow_their_line() {
+        use crate::comments::{Comment, Side};
+        let old: String = (1..=10).map(|i| format!("line {i}\n")).collect();
+        let new = old.replace("line 5\n", "line five\n");
+        let mut review = loaded_review(&[(Section::Unstaged, "f.rs", &old, &new)]);
+        let comment = |id, side, start, end, text: &str| Comment {
+            id,
+            path: "f.rs".into(),
+            side,
+            start,
+            end,
+            excerpt: Vec::new(),
+            text: text.into(),
+        };
+        review.set_comments(vec![
+            comment(1, Side::New, 5, 5, "first line\nsecond line"),
+            comment(2, Side::Old, 5, 5, "on the removal"),
+            comment(3, Side::New, 99, 99, "outdated"),
+        ]);
+        review.rebuild_rows();
+        let rows = review.rows();
+        let find = |pred: &dyn Fn(&Row) -> bool| rows.iter().position(pred).unwrap();
+        let added = find(
+            &|r| matches!(r, Row::Line { line, .. } if review.files[0].diff().unwrap().lines[*line].kind == LineKind::Added),
+        );
+        let removed = find(
+            &|r| matches!(r, Row::Line { line, .. } if review.files[0].diff().unwrap().lines[*line].kind == LineKind::Removed),
+        );
+        assert_eq!(
+            rows[removed + 1],
+            Row::Comment {
+                file: 0,
+                comment: 1,
+                line: 0
+            }
+        );
+        assert_eq!(
+            rows[added + 1],
+            Row::Comment {
+                file: 0,
+                comment: 0,
+                line: 0
+            }
+        );
+        assert_eq!(
+            rows[added + 2],
+            Row::Comment {
+                file: 0,
+                comment: 0,
+                line: 1
+            },
+            "one row per text line"
+        );
+        assert_eq!(
+            rows[rows.len() - 1],
+            Row::Comment {
+                file: 0,
+                comment: 2,
+                line: 0
+            },
+            "unanchored at file end"
+        );
+        assert_eq!(
+            review.action_target(added + 1, None),
+            None,
+            "actions skip comment rows"
+        );
     }
 
     #[test]

@@ -19,6 +19,10 @@ use crate::patch::{self, Direction, Header, PatchError};
 use crate::repo::{ChangeStatus, FileChange, Section, Source};
 
 pub const UNDO_REF: &str = "refs/goro/undo";
+
+const READ_ONLY_SNAPSHOT: OpError = OpError::Unsupported(
+    "a turn's changes are read-only; switch to the working tree (w) to act on them",
+);
 /// The previous generation of undo history (see [`keep_reachable`]).
 pub const UNDO_PREVIOUS_REF: &str = "refs/goro/undo-previous";
 /// Discards per generation of undo history.
@@ -157,8 +161,10 @@ pub fn stage(
     diff: Option<&FileDiff>,
     selection: Selection,
 ) -> Result<Undo, OpError> {
-    if change.section == Section::Staged {
-        return Err(OpError::Unsupported("already staged"));
+    match change.section {
+        Section::Staged => return Err(OpError::Unsupported("already staged")),
+        Section::Snapshot => return Err(READ_ONLY_SNAPSHOT),
+        Section::Unstaged | Section::Untracked => {}
     }
     if change.status == ChangeStatus::Conflicted {
         return Err(OpError::Unsupported("resolve the conflict first"));
@@ -265,6 +271,7 @@ pub fn discard(
                 "unstage these changes before discarding them",
             ));
         }
+        Section::Snapshot => return Err(READ_ONLY_SNAPSHOT),
         Section::Unstaged | Section::Untracked => {}
     }
     if change.status == ChangeStatus::Conflicted {
