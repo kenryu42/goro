@@ -49,7 +49,9 @@ pub fn watch(
 
     let (tx, rx) = mpsc::channel::<PathBuf>();
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-        if let Ok(event) = event {
+        if let Ok(event) = event
+            && is_change(&event.kind)
+        {
             for path in event.paths {
                 let _ = tx.send(path);
             }
@@ -133,6 +135,19 @@ fn classify(
         None
     } else {
         Some(Dirty::Paths(dirty))
+    }
+}
+
+/// Whether an event is a write. Reads must not count: Linux reports opens and reads, and
+/// reloading reads files, which would trigger itself forever.
+fn is_change(kind: &notify::EventKind) -> bool {
+    use notify::EventKind;
+    use notify::event::{MetadataKind, ModifyKind};
+    match kind {
+        EventKind::Access(_) => false,
+        EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime)) => false,
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) | EventKind::Any => true,
+        EventKind::Other => false,
     }
 }
 
@@ -247,6 +262,20 @@ mod tests {
                 .any(|d| matches!(d, Dirty::Paths(p) if p.is_empty())),
             "index change reported without dirty paths: {reports_after_add:?}"
         );
+    }
+
+    #[test]
+    fn only_writes_count_as_changes() {
+        use notify::event::{AccessKind, CreateKind, MetadataKind, ModifyKind, RemoveKind};
+        use notify::EventKind;
+        // Reading a file (Linux reports opens and reads) must not trigger a reload: status
+        // itself reads files, which would loop forever.
+        assert!(!is_change(&EventKind::Access(AccessKind::Any)));
+        assert!(!is_change(&EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime))));
+        assert!(is_change(&EventKind::Create(CreateKind::File)));
+        assert!(is_change(&EventKind::Modify(ModifyKind::Any)));
+        assert!(is_change(&EventKind::Modify(ModifyKind::Metadata(MetadataKind::Permissions))));
+        assert!(is_change(&EventKind::Remove(RemoveKind::Any)));
     }
 
     #[test]
