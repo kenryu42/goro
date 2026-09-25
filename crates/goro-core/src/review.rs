@@ -11,6 +11,7 @@ use gix::bstr::ByteSlice;
 use crate::comments::{Comment, Side};
 use crate::diff::{FileDiff, LineKind};
 use crate::repo::{FileChange, Loaded, Repo, Section, ThreadRepo};
+use crate::settings::DiffLayout;
 use crate::store::stable_hash;
 use crate::syntax::{self, Language, Span, Style};
 
@@ -208,6 +209,18 @@ pub enum Row {
         file: usize,
         note: Note,
     },
+    /// Split layout: an old-side and a new-side line side by side (a context line is
+    /// the same index on both sides).
+    Pair {
+        file: usize,
+        old: Option<usize>,
+        new: Option<usize>,
+    },
+    /// Part `part` of an image preview spanning [`IMAGE_ROWS`] rows.
+    Image {
+        file: usize,
+        part: usize,
+    },
     /// Line `line` of a comment's text (index into [`Review::comments`]).
     Comment {
         file: usize,
@@ -223,6 +236,8 @@ impl Row {
             | Row::Hunk { file, .. }
             | Row::Line { file, .. }
             | Row::Note { file, .. }
+            | Row::Pair { file, .. }
+            | Row::Image { file, .. }
             | Row::Comment { file, .. } => file,
         }
     }
@@ -285,6 +300,7 @@ pub struct Review {
     /// Per file, the hash of each hunk (computed on rebuild).
     hunk_hashes: Vec<Vec<u64>>,
     comments: Vec<Comment>,
+    layout: DiffLayout,
 }
 
 /// Changed-line hashes per path, as of the last look.
@@ -339,6 +355,7 @@ impl Review {
             reviewed: HashSet::new(),
             hunk_hashes: Vec::new(),
             comments: Vec::new(),
+            layout: DiffLayout::Unified,
         };
         review.rebuild_rows();
         review.rebuild_tree();
@@ -416,6 +433,10 @@ impl Review {
                         }
                         Row::Hunk { file: f, hunk } if f == file => lines.extend(hunk_lines(hunk)),
                         Row::Line { file: f, line } if f == file => lines.push(line),
+                        Row::Pair { file: f, old, new } if f == file => {
+                            lines.extend(old);
+                            lines.extend(new);
+                        }
                         _ => {}
                     }
                 }
@@ -424,10 +445,21 @@ impl Review {
                 Target::Lines(lines)
             }
             None => match self.rows[cursor] {
-                Row::File { .. } | Row::Note { .. } => Target::WholeFile,
-                Row::Comment { .. } => return None,
+                Row::File { .. } | Row::Note { .. } | Row::Image { .. } => Target::WholeFile,
+                Row::Comment { .. }
+                | Row::Pair {
+                    old: None,
+                    new: None,
+                    ..
+                } => return None,
                 Row::Hunk { hunk, .. } => Target::Lines(hunk_lines(hunk)),
-                Row::Line { line, .. } => {
+                Row::Line { line, .. }
+                | Row::Pair {
+                    old: Some(line), ..
+                }
+                | Row::Pair {
+                    new: Some(line), ..
+                } => {
                     let diff = self.files[file].diff()?;
                     let hunk = diff.hunks.iter().position(|h| h.lines.contains(&line))?;
                     Target::Lines(hunk_lines(hunk))
@@ -470,13 +502,17 @@ impl Review {
 
     /// Index of the longest row, for sizing horizontal scroll.
     pub fn widest_row(&self) -> Option<usize> {
+        let width = |file: usize, line: Option<usize>| {
+            line.and_then(|line| self.files[file].diff().map(|d| d.lines[line].content.len()))
+                .unwrap_or(0)
+        };
         self.rows
             .iter()
             .enumerate()
             .max_by_key(|(_, row)| match **row {
-                Row::Line { file, line } => self.files[file]
-                    .diff()
-                    .map_or(0, |d| d.lines[line].content.len()),
+                Row::Line { file, line } => width(file, Some(line)),
+                // Both halves share the row, so the wider side sets its width.
+                Row::Pair { file, old, new } => 2 * width(file, old).max(width(file, new)),
                 _ => 0,
             })
             .map(|(ix, _)| ix)
@@ -517,6 +553,11 @@ impl Review {
                 Content::Loaded(Loaded::Submodule) => Some(Note::Submodule),
                 Content::Loaded(Loaded::Conflict) => Some(Note::Conflict),
                 Content::Loaded(Loaded::NotAFile) => Some(Note::NotAFile),
+                Content::Loaded(Loaded::Image { .. }) => {
+                    self.rows
+                        .extend((0..IMAGE_ROWS).map(|part| Row::Image { file, part }));
+                    None
+                }
                 Content::Loaded(Loaded::Text(diff)) if diff.hunks.is_empty() => {
                     Some(Note::NoContentChange)
                 }
@@ -530,31 +571,52 @@ impl Review {
                         if self.reviewed.contains(&self.hunk_hashes[file][hunk_ix]) {
                             continue;
                         }
-                        for line in hunk.lines.clone() {
-                            let l = &diff.lines[line];
-                            let is_new = l.kind != LineKind::Context
-                                && seen.is_some_and(|seen| {
-                                    !seen.is_some_and(|s| {
-                                        s.contains(&line_hash(l.kind, diff.line_bytes(l)))
+                        for (old_line, new_line) in
+                            display_pairs(diff, hunk.lines.clone(), self.layout)
+                        {
+                            let sides = [old_line, new_line];
+                            let mut lines: Vec<usize> = sides.into_iter().flatten().collect();
+                            lines.dedup();
+                            let is_new = lines.iter().any(|&line| {
+                                let l = &diff.lines[line];
+                                l.kind != LineKind::Context
+                                    && seen.is_some_and(|seen| {
+                                        !seen.is_some_and(|s| {
+                                            s.contains(&line_hash(l.kind, diff.line_bytes(l)))
+                                        })
                                     })
-                                });
+                            });
                             if is_new {
                                 self.new_rows.push(self.rows.len());
                                 self.new_per_file[file] += 1;
                             }
-                            self.rows.push(Row::Line { file, line });
-                            let anchor = match l.kind {
-                                LineKind::Removed => (Side::Old, l.old_no),
-                                _ => (Side::New, l.new_no),
-                            };
-                            if let (side, Some(number)) = anchor {
-                                for (ix, comment) in self.comments.iter().enumerate() {
-                                    if comment.side == side
-                                        && comment.end == number
-                                        && comment.path.as_bytes() == entry.change.path.as_slice()
-                                        && placed.insert(ix)
-                                    {
-                                        push_comment_rows(&mut self.rows, file, ix, comment);
+                            self.rows.push(match self.layout {
+                                DiffLayout::Unified => Row::Line {
+                                    file,
+                                    line: lines[0],
+                                },
+                                DiffLayout::Split => Row::Pair {
+                                    file,
+                                    old: old_line,
+                                    new: new_line,
+                                },
+                            });
+                            for line in lines {
+                                let l = &diff.lines[line];
+                                let anchor = match l.kind {
+                                    LineKind::Removed => (Side::Old, l.old_no),
+                                    _ => (Side::New, l.new_no),
+                                };
+                                if let (side, Some(number)) = anchor {
+                                    for (ix, comment) in self.comments.iter().enumerate() {
+                                        if comment.side == side
+                                            && comment.end == number
+                                            && comment.path.as_bytes()
+                                                == entry.change.path.as_slice()
+                                            && placed.insert(ix)
+                                        {
+                                            push_comment_rows(&mut self.rows, file, ix, comment);
+                                        }
                                     }
                                 }
                             }
@@ -580,6 +642,15 @@ impl Review {
                 }
             }
         }
+    }
+
+    /// Unified or side by side. Call [`Review::rebuild_rows`] after.
+    pub fn set_layout(&mut self, layout: DiffLayout) {
+        self.layout = layout;
+    }
+
+    pub fn layout(&self) -> DiffLayout {
+        self.layout
     }
 
     /// Set review comments. Call [`Review::rebuild_rows`] after.
@@ -670,14 +741,22 @@ impl Review {
         let file = row.file();
         let hunks: Vec<usize> = match row {
             Row::Hunk { hunk, .. } => vec![hunk],
-            Row::Line { line, .. } => self.files[file]
+            Row::Line { line, .. }
+            | Row::Pair {
+                old: Some(line), ..
+            }
+            | Row::Pair {
+                new: Some(line), ..
+            } => self.files[file]
                 .diff()
                 .and_then(|d| d.hunks.iter().position(|h| h.lines.contains(&line)))
                 .into_iter()
                 .collect(),
-            Row::File { .. } | Row::Note { .. } | Row::Comment { .. } => {
-                (0..self.hunk_hashes[file].len()).collect()
-            }
+            Row::File { .. }
+            | Row::Note { .. }
+            | Row::Comment { .. }
+            | Row::Pair { .. }
+            | Row::Image { .. } => (0..self.hunk_hashes[file].len()).collect(),
         };
         let mark = !hunks.iter().all(|&h| self.hunk_is_reviewed(file, h));
         for h in hunks {
@@ -704,6 +783,7 @@ impl Review {
     /// Keep view state (collapsed directories) from the review this one replaces.
     pub fn carry_view_state(&mut self, previous: &Review) {
         self.collapsed = previous.collapsed.clone();
+        self.layout = previous.layout;
         self.comments = previous.comments.clone();
         self.seen = previous.seen.clone();
         self.reviewed = previous.reviewed.clone();
@@ -802,6 +882,49 @@ fn build_tree_level(
     }
 }
 
+/// The lines of a hunk as display rows: `(old side, new side)`. Unified: one line per row
+/// (on whichever side it belongs). Split: runs of removals paired with the additions
+/// that follow them.
+fn display_pairs(
+    diff: &FileDiff,
+    lines: Range<usize>,
+    layout: DiffLayout,
+) -> Vec<(Option<usize>, Option<usize>)> {
+    let kind = |ix: usize| diff.lines[ix].kind;
+    if layout == DiffLayout::Unified {
+        return lines
+            .map(|ix| match kind(ix) {
+                LineKind::Removed => (Some(ix), None),
+                _ => (None, Some(ix)),
+            })
+            .collect();
+    }
+    let mut pairs = Vec::new();
+    let mut ix = lines.start;
+    while ix < lines.end {
+        if kind(ix) == LineKind::Context {
+            pairs.push((Some(ix), Some(ix)));
+            ix += 1;
+            continue;
+        }
+        let removed_start = ix;
+        while ix < lines.end && kind(ix) == LineKind::Removed {
+            ix += 1;
+        }
+        let added_start = ix;
+        while ix < lines.end && kind(ix) == LineKind::Added {
+            ix += 1;
+        }
+        let (removed, added) = (removed_start..added_start, added_start..ix);
+        for k in 0..removed.len().max(added.len()) {
+            let old = (k < removed.len()).then(|| removed.start + k);
+            let new = (k < added.len()).then(|| added.start + k);
+            pairs.push((old, new));
+        }
+    }
+    pairs
+}
+
 fn push_comment_rows(rows: &mut Vec<Row>, file: usize, comment: usize, c: &Comment) {
     let lines = c.text.lines().count().max(1);
     rows.extend((0..lines).map(|line| Row::Comment {
@@ -810,6 +933,9 @@ fn push_comment_rows(rows: &mut Vec<Row>, file: usize, comment: usize, c: &Comme
         line,
     }));
 }
+
+/// Rows an image preview occupies (rows are uniform height, so an image spans several).
+pub const IMAGE_ROWS: usize = 12;
 
 /// Tab stop width used when rendering code.
 pub const TAB_WIDTH: usize = 4;
@@ -1238,6 +1364,63 @@ mod tests {
             None,
             "actions skip comment rows"
         );
+    }
+
+    #[test]
+    fn split_layout_pairs_removals_with_additions() {
+        use crate::settings::DiffLayout;
+        let old = "a\nb\nc\nd\ne\n";
+        let new = "a\nB\nC\nX\nd\ne\n";
+        let mut review = loaded_review(&[(Section::Unstaged, "f.rs", old, new)]);
+        review.set_layout(DiffLayout::Split);
+        review.rebuild_rows();
+        let diff = review.files[0].diff().unwrap().clone();
+        let text = |ix: Option<usize>| {
+            ix.map(|ix| String::from_utf8_lossy(diff.line_bytes(&diff.lines[ix])).into_owned())
+        };
+        let pairs: Vec<(Option<String>, Option<String>)> = review
+            .rows()
+            .iter()
+            .filter_map(|r| match r {
+                Row::Pair { old, new, .. } => Some((text(*old), text(*new))),
+                _ => None,
+            })
+            .collect();
+        let s = |x: &str| Some(x.to_string());
+        assert_eq!(
+            pairs,
+            [
+                (s("a"), s("a")),
+                (s("b"), s("B")),
+                (s("c"), s("C")),
+                (None, s("X")),
+                (s("d"), s("d")),
+                (s("e"), s("e")),
+            ]
+        );
+        // Actions and hunk navigation still work on paired rows.
+        let pair_row = review
+            .rows()
+            .iter()
+            .position(|r| {
+                matches!(
+                    r,
+                    Row::Pair {
+                        old: Some(_),
+                        new: Some(_),
+                        ..
+                    }
+                ) && !matches!(r, Row::Pair { old, new, .. } if old == new)
+            })
+            .unwrap();
+        let Some((0, Target::Lines(lines))) = review.action_target(pair_row, Some(pair_row)) else {
+            panic!("a paired row targets its lines");
+        };
+        assert_eq!(lines.len(), 2, "both sides of the pair");
+        assert_eq!(review.next_hunk_row(0), Some(1));
+        review.set_layout(DiffLayout::Unified);
+        review.rebuild_rows();
+        assert!(review.rows().iter().all(|r| !matches!(r, Row::Pair { .. })));
     }
 
     #[test]

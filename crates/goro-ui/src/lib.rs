@@ -1,6 +1,7 @@
 //! Goro's app: one window per repository, each a file tree and commit box beside one
 //! continuous, virtualized diff stream.
 
+mod app_settings;
 mod diff_rows;
 mod picker;
 mod text_buffer;
@@ -117,16 +118,25 @@ actions!(
         /// Copy all comments as markdown.
         CopyComments,
         /// Send the comments to the agent waiting on `goro --wait`.
-        SendReview
+        SendReview,
+        /// Unified ↔ side-by-side.
+        ToggleLayout,
+        /// Open the settings file in an editor.
+        OpenSettings
     ]
 );
 
 /// Keys that only apply while the diff (not a text field) has focus.
-const DIFF_CONTEXT: &str = "Goro && !TextEditor";
+pub(crate) const DIFF_CONTEXT: &str = "Goro && !TextEditor";
 
 /// How long to hold the first window for its review, so the first frame already shows the
 /// diff instead of an empty window. Slow repositories open immediately and stream in.
 const OPEN_WAIT: Duration = Duration::from_millis(250);
+
+/// Load the settings file and apply it (keybindings, hotkey), reloading on change.
+pub fn init_settings(cx: &mut App) {
+    app_settings::init(cx);
+}
 
 pub fn bind_keys(cx: &mut App) {
     let diff = Some(DIFF_CONTEXT);
@@ -149,6 +159,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-enter", SaveComment, Some("CommentBox")),
         KeyBinding::new("ctrl-enter", SaveComment, Some("CommentBox")),
         KeyBinding::new("escape", CancelComment, Some("CommentBox > TextEditor")),
+        KeyBinding::new("v", ToggleLayout, diff),
+        KeyBinding::new("cmd-,", OpenSettings, None),
+        KeyBinding::new("ctrl-,", OpenSettings, None),
         KeyBinding::new("j", CursorDown, diff),
         KeyBinding::new("down", CursorDown, diff),
         KeyBinding::new("k", CursorUp, diff),
@@ -262,13 +275,32 @@ pub fn run(
     mut requests: UnboundedReceiver<AppRequest>,
     store: Option<Store>,
 ) {
-    gpui_kit::application().run(move |cx: &mut App| {
+    let app = gpui_kit::application();
+    // macOS: clicking the Dock icon with no windows open opens one.
+    app.on_reopen(|cx| {
+        if cx.windows().is_empty() {
+            open_repo(None, cx);
+        }
+    });
+    app.run(move |cx: &mut App| {
         startup.mark("platform ready");
         cx.on_action(|_: &Quit, cx| cx.quit());
-        bind_keys(cx);
-        cx.set_menus([Menu::new("Goro").items([MenuItem::action("Quit Goro", Quit)])]);
+        cx.on_action(|_: &OpenSettings, cx| {
+            if let Err(err) = app_settings::open_settings_file(cx) {
+                eprintln!("goro: can't open settings: {err}");
+            }
+        });
+        app_settings::init(cx);
+        app_settings::on_hotkey(cx, show_goro);
+        startup.mark("settings applied");
+        cx.set_menus([Menu::new("Goro").items([
+            MenuItem::action("Settings…", OpenSettings),
+            MenuItem::separator(),
+            MenuItem::action("Quit Goro", Quit),
+        ])]);
         cx.on_window_closed(|cx, _| {
-            if cx.windows().is_empty() {
+            // Mac apps stay running without windows (the hotkey and Dock reopen them).
+            if cx.windows().is_empty() && !cfg!(target_os = "macos") {
                 cx.quit();
             }
         })
@@ -295,6 +327,21 @@ impl gpui_kit::Global for AppStore {}
 
 fn app_store(cx: &App) -> Option<Store> {
     cx.try_global::<AppStore>().and_then(|s| s.0.clone())
+}
+
+/// The global hotkey: bring Goro forward, opening the detected repository if no window
+/// is open.
+fn show_goro(cx: &mut App) {
+    let windows = cx.windows();
+    match windows.last() {
+        Some(window) => {
+            let _ = window.update(cx, |_, window, _| window.activate_window());
+            cx.activate(true);
+        }
+        None => {
+            open_repo(None, cx);
+        }
+    }
 }
 
 pub fn handle_request(request: AppRequest, cx: &mut App) {

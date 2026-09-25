@@ -1,8 +1,9 @@
 //! Rendering of the diff stream's rows: file headers, hunk headers, lines and notes.
 
 use goro_core::diff::LineKind;
+use goro_core::repo::Loaded;
 use goro_core::repo::Section;
-use goro_core::review::{Note, Review, Row, display_line};
+use goro_core::review::{Content, IMAGE_ROWS, Note, Review, Row, display_line};
 use goro_core::syntax::spans_in;
 use gpui_kit::{
     AnyElement, ClickEvent, Context, Div, FontWeight, HighlightStyle, SharedString, Stateful,
@@ -28,6 +29,7 @@ pub(crate) struct RowFlags {
 }
 
 pub(crate) fn render_row(
+    view: &GoroView,
     review: &Review,
     ix: usize,
     flags: RowFlags,
@@ -73,6 +75,41 @@ pub(crate) fn render_row(
                 .children(action_buttons(section, ix, "hunk", theme, cx))
         }
         Row::Line { file, line } => render_line(review, file, line, ix, theme),
+        Row::Pair { file, old, new } => div()
+            .id(("row", ix))
+            .h(px(ROW_HEIGHT))
+            .w_full()
+            .flex()
+            .flex_row()
+            .child(half(review, file, old, Half::Old, theme))
+            .child(div().w(px(1.0)).h_full().bg(theme.border))
+            .child(half(review, file, new, Half::New, theme)),
+        Row::Image { file, part } => {
+            let row = div().id(("row", ix)).h(px(ROW_HEIGHT)).w_full();
+            match (&review.files[file].content, part) {
+                (Content::Loaded(Loaded::Image { kind, old, new }), 0) => row.relative().child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left(gutter_width())
+                        .h(px(ROW_HEIGHT * IMAGE_ROWS as f32))
+                        .flex()
+                        .gap_4()
+                        .py_2()
+                        .child(image_panel(
+                            "Before",
+                            old.as_ref().map(|b| view.image_for(b, *kind)),
+                            theme,
+                        ))
+                        .child(image_panel(
+                            "After",
+                            new.as_ref().map(|b| view.image_for(b, *kind)),
+                            theme,
+                        )),
+                ),
+                _ => row,
+            }
+        }
         Row::Comment { comment, line, .. } => {
             let c = &review.comments()[comment];
             let text = c.text.lines().nth(line).unwrap_or_default().to_string();
@@ -244,6 +281,79 @@ pub(crate) fn button(
         .into_any_element()
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Half {
+    Old,
+    New,
+}
+
+/// One side of a split row: its line number and content (empty if the side has no line).
+fn half(review: &Review, file: usize, line: Option<usize>, side: Half, theme: &Theme) -> Div {
+    let el = div()
+        .h_full()
+        .w_1_2()
+        .flex()
+        .flex_row()
+        .overflow_hidden()
+        .whitespace_nowrap();
+    let Some(line) = line else {
+        return el.bg(theme.file_header_bg);
+    };
+    let cell = line_cell(review, file, line, theme);
+    let number = match side {
+        Half::Old => cell.old_no,
+        Half::New => cell.new_no,
+    };
+    el.when_some(cell.bg, |el, bg| el.bg(bg))
+        .child(
+            div()
+                .flex_none()
+                .w(px((GUTTER_DIGITS + 3) as f32 * 7.6))
+                .text_color(theme.muted)
+                .when_some(cell.gutter_bg, |el, bg| el.bg(bg))
+                .child(format!(
+                    "{} {} ",
+                    number
+                        .map(|n| format!("{n:>width$}", width = GUTTER_DIGITS))
+                        .unwrap_or_else(|| " ".repeat(GUTTER_DIGITS)),
+                    cell.sign
+                )),
+        )
+        .child(div().pl_1().child(cell.content))
+}
+
+/// One side of an image preview, sized to fit inside the rows reserved for it.
+fn image_panel(label: &str, image: Option<std::sync::Arc<gpui_kit::Image>>, theme: &Theme) -> Div {
+    const WIDTH: f32 = 320.0;
+    // The reserved rows, minus the label and padding.
+    let height = ROW_HEIGHT * IMAGE_ROWS as f32 - ROW_HEIGHT - 24.0;
+    let frame = div()
+        .w(px(WIDTH))
+        .h(px(height))
+        .overflow_hidden()
+        .border_1()
+        .border_color(theme.border);
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(div().text_color(theme.muted).child(label.to_string()))
+        .child(match image {
+            Some(image) => frame.child(
+                gpui_kit::img(image)
+                    .w(px(WIDTH - 2.0))
+                    .h(px(height - 2.0))
+                    .object_fit(gpui_kit::ObjectFit::Contain),
+            ),
+            None => frame
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(theme.muted)
+                .child("(none)"),
+        })
+}
+
 fn note_text(note: Note) -> String {
     match note {
         Note::Loading => "Loading…".into(),
@@ -259,13 +369,18 @@ fn note_text(note: Note) -> String {
     }
 }
 
-fn render_line(
-    review: &Review,
-    file: usize,
-    line: usize,
-    ix: usize,
-    theme: &Theme,
-) -> Stateful<Div> {
+/// The pieces of a rendered diff line.
+struct LineCell {
+    old_no: Option<u32>,
+    new_no: Option<u32>,
+    sign: &'static str,
+    bg: Option<gpui_kit::Hsla>,
+    gutter_bg: Option<gpui_kit::Hsla>,
+    content: StyledText,
+    no_newline: bool,
+}
+
+fn line_cell(review: &Review, file: usize, line: usize, theme: &Theme) -> LineCell {
     let entry = &review.files[file];
     let diff = entry.diff().expect("line rows have diffs");
     let l = &diff.lines[line];
@@ -296,15 +411,39 @@ fn render_line(
         LineKind::Added => (Some(theme.added_bg), Some(theme.added_gutter_bg), "+"),
         LineKind::Removed => (Some(theme.removed_bg), Some(theme.removed_gutter_bg), "-"),
     };
-    let number = |n: Option<u32>| {
-        n.map(|n| format!("{n:>width$}", width = GUTTER_DIGITS))
-            .unwrap_or_else(|| " ".repeat(GUTTER_DIGITS))
-    };
-    let gutter = format!("{} {} {sign} ", number(l.old_no), number(l.new_no));
     let mut content = StyledText::new(SharedString::from(text));
     if !highlights.is_empty() {
         content = content.with_highlights(highlights);
     }
+    LineCell {
+        old_no: l.old_no,
+        new_no: l.new_no,
+        sign,
+        bg,
+        gutter_bg,
+        content,
+        no_newline: l.no_newline,
+    }
+}
+
+fn render_line(
+    review: &Review,
+    file: usize,
+    line: usize,
+    ix: usize,
+    theme: &Theme,
+) -> Stateful<Div> {
+    let cell = line_cell(review, file, line, theme);
+    let number = |n: Option<u32>| {
+        n.map(|n| format!("{n:>width$}", width = GUTTER_DIGITS))
+            .unwrap_or_else(|| " ".repeat(GUTTER_DIGITS))
+    };
+    let gutter = format!(
+        "{} {} {} ",
+        number(cell.old_no),
+        number(cell.new_no),
+        cell.sign
+    );
     div()
         .id(("row", ix))
         .h(px(ROW_HEIGHT))
@@ -312,17 +451,17 @@ fn render_line(
         .flex()
         .flex_row()
         .whitespace_nowrap()
-        .when_some(bg, |el, bg| el.bg(bg))
+        .when_some(cell.bg, |el, bg| el.bg(bg))
         .child(
             div()
                 .flex_none()
                 .w(gutter_width())
                 .text_color(theme.muted)
-                .when_some(gutter_bg, |el, bg| el.bg(bg))
+                .when_some(cell.gutter_bg, |el, bg| el.bg(bg))
                 .child(gutter),
         )
-        .child(div().pl_1().child(content))
-        .when(l.no_newline, |el| {
+        .child(div().pl_1().child(cell.content))
+        .when(cell.no_newline, |el| {
             el.child(div().pl_2().text_color(theme.muted).child("⏎̸"))
         })
 }

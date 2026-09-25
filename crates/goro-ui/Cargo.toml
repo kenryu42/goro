@@ -10,6 +10,8 @@ goro-core.workspace = true
 gpui-kit.workspace = true
 futures.workspace = true
 unicode-segmentation.workspace = true
+global-hotkey.workspace = true
+notify.workspace = true
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }

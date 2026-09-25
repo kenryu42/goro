@@ -1,7 +1,12 @@
 //! `goro`: open a review of a repository's working tree.
 //!
+//! On Windows this is a GUI program (no console window when started from Explorer); CLI
+//! commands attach to the calling terminal's console for their output.
+//!
 //! One instance per user: if Goro is already running, this hands the request to it and
 //! exits. Started from a terminal, it detaches so the shell gets its prompt back.
+
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod ipc;
 
@@ -95,6 +100,7 @@ enum HooksAction {
 
 fn main() -> ExitCode {
     let t0 = Instant::now();
+    attach_parent_console();
     let cli = Cli::parse();
     match cli.command {
         Some(Cmd::Hook { agent, event }) => {
@@ -112,6 +118,17 @@ fn main() -> ExitCode {
         Some(Cmd::Hooks { action }) => hooks_command(action),
         Some(Cmd::Comments { path, clear }) => comments_command(path, clear),
         None => open(cli, t0),
+    }
+}
+
+/// Windows GUI programs have no console; reattach to the caller's so `goro comments`,
+/// `--wait` and friends print where they were run. Output to pipes works either way.
+fn attach_parent_console() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+        // SAFETY: plain Win32 call; failure (no parent console) is fine.
+        unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
     }
 }
 

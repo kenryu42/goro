@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Goro
+GenericName=Code Review
+Comment=Review what your coding agent changed
+Exec=goro %F
+Icon=goro
+Terminal=false
+Categories=Development;RevisionControl;
+StartupWMClass=dev.goro.Goro

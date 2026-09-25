@@ -98,6 +98,40 @@ pub enum Loaded {
     Conflict,
     /// An untracked directory that is itself a repository, or a non-file entry.
     NotAFile,
+    /// An image, shown before and after instead of as a diff.
+    Image {
+        kind: ImageKind,
+        old: Option<Arc<[u8]>>,
+        new: Option<Arc<[u8]>>,
+    },
+}
+
+/// Raster image formats shown as images (SVG stays a text diff).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageKind {
+    Png,
+    Jpeg,
+    Gif,
+    Webp,
+    Bmp,
+    Tiff,
+    Ico,
+}
+
+impl ImageKind {
+    pub fn for_path(path: &BStr) -> Option<Self> {
+        let ext = path.rsplit_str(".").next()?.to_ascii_lowercase();
+        Some(match ext.as_slice() {
+            b"png" => Self::Png,
+            b"jpg" | b"jpeg" => Self::Jpeg,
+            b"gif" => Self::Gif,
+            b"webp" => Self::Webp,
+            b"bmp" => Self::Bmp,
+            b"tif" | b"tiff" => Self::Tiff,
+            b"ico" => Self::Ico,
+            _ => return None,
+        })
+    }
 }
 
 pub struct Repo {
@@ -371,6 +405,11 @@ impl Loader<'_> {
             (Side::Submodule, _) | (_, Side::Submodule) => Loaded::Submodule,
             (Side::NotAFile, _) | (_, Side::NotAFile) => Loaded::NotAFile,
             (Side::TooLarge(len), _) | (_, Side::TooLarge(len)) => Loaded::TooLarge { len },
+            (old, new) if ImageKind::for_path(change.path.as_ref()).is_some() => Loaded::Image {
+                kind: ImageKind::for_path(change.path.as_ref()).expect("checked above"),
+                old: old.into_image_bytes(),
+                new: new.into_image_bytes(),
+            },
             (old, new) => {
                 let old = old.into_bytes();
                 let new = new.into_bytes();
@@ -451,6 +490,13 @@ impl Loader<'_> {
 }
 
 impl Side {
+    fn into_image_bytes(self) -> Option<Arc<[u8]>> {
+        match self {
+            Side::Bytes(bytes) => Some(bytes.into()),
+            _ => None,
+        }
+    }
+
     fn into_bytes(self) -> Vec<u8> {
         match self {
             Side::Bytes(bytes) => bytes,

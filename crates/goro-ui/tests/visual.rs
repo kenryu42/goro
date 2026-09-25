@@ -707,6 +707,124 @@ fn turns_are_reviewed_on_their_own() {
     drop(repo_dir);
 }
 
+/// A `size`×`size` PNG of one color (stored deflate blocks, so no compression library).
+fn png(size: u32, rgb: [u8; 3]) -> Vec<u8> {
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &b in bytes {
+            crc ^= b as u32;
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    0xedb8_8320 ^ (crc >> 1)
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+    fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        out.extend((data.len() as u32).to_be_bytes());
+        let mut body = kind.to_vec();
+        body.extend(data);
+        out.extend(&body);
+        out.extend(crc32(&body).to_be_bytes());
+    }
+    // Each scanline: filter type 0, then the pixels.
+    let scanline: Vec<u8> = std::iter::once(0)
+        .chain(std::iter::repeat_n(rgb, size as usize).flatten())
+        .collect();
+    let raw = scanline.repeat(size as usize);
+    let mut zlib = vec![0x78, 0x01];
+    for (ix, block) in raw.chunks(65_535).enumerate() {
+        let last = (ix + 1) * 65_535 >= raw.len();
+        zlib.push(last as u8);
+        zlib.extend((block.len() as u16).to_le_bytes());
+        zlib.extend((!(block.len() as u16)).to_le_bytes());
+        zlib.extend(block);
+    }
+    let (mut a, mut b) = (1u32, 0u32);
+    for &byte in &raw {
+        a = (a + byte as u32) % 65_521;
+        b = (b + a) % 65_521;
+    }
+    zlib.extend(((b << 16) | a).to_be_bytes());
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut ihdr = size.to_be_bytes().to_vec();
+    ihdr.extend(size.to_be_bytes());
+    ihdr.extend([8, 2, 0, 0, 0]);
+    chunk(&mut out, b"IHDR", &ihdr);
+    chunk(&mut out, b"IDAT", &zlib);
+    chunk(&mut out, b"IEND", &[]);
+    out
+}
+
+fn split_view_and_image_diffs() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    git(&root, &["init", "-q"]);
+    write(&root, "src/words.rs", RUST_BEFORE);
+    write(&root, "icon.png", png(32, [200, 60, 60]));
+    git(&root, &["add", "-A"]);
+    git(&root, &["commit", "-q", "-m", "base"]);
+    write(&root, "src/words.rs", RUST_AFTER);
+    write(&root, "icon.png", png(32, [60, 120, 220]));
+    let store = tempfile::tempdir().unwrap();
+    let (mut cx, window) = open_repo(&root, WindowAppearance::Dark, Store::at(store.path()));
+    let image_rows = read(&mut cx, window, |v, _| {
+        v.review()
+            .unwrap()
+            .rows()
+            .iter()
+            .filter(|r| matches!(r, Row::Image { .. }))
+            .count()
+    });
+    assert_eq!(image_rows, goro_core::review::IMAGE_ROWS);
+    press(&mut cx, window, "v");
+    let pairs = read(&mut cx, window, |v, _| {
+        v.review()
+            .unwrap()
+            .rows()
+            .iter()
+            .filter(|r| matches!(r, Row::Pair { .. }))
+            .count()
+    });
+    assert!(pairs > 0, "v switches to side by side");
+    save_screenshot(&mut cx, window, "review-split-image.png");
+    press(&mut cx, window, "v");
+    let pairs = read(&mut cx, window, |v, _| {
+        v.review()
+            .unwrap()
+            .rows()
+            .iter()
+            .filter(|r| matches!(r, Row::Pair { .. }))
+            .count()
+    });
+    assert_eq!(pairs, 0);
+}
+
+fn settings_keybindings_apply() {
+    let config = PathBuf::from(std::env::var_os("GORO_CONFIG_DIR").unwrap());
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("settings.json"),
+        r#"{ "global_hotkey": null, "keybindings": { "ctrl-j": "goro::NextHunk", "n": "" } }"#,
+    )
+    .unwrap();
+    let (mut cx, window, _dirs) = open(WindowAppearance::Dark);
+    cx.update(goro_ui::init_settings);
+    press(&mut cx, window, "n");
+    assert_eq!(read(&mut cx, window, |v, _| v.cursor()), 0, "n was unbound");
+    press(&mut cx, window, "ctrl-j");
+    let row = read(&mut cx, window, |v, _| {
+        v.review().unwrap().rows()[v.cursor()]
+    });
+    assert!(
+        matches!(row, Row::Hunk { .. }),
+        "ctrl-j runs NextHunk: {row:?}"
+    );
+}
+
 fn main() {
     // Isolate every git process (including Goro's own) from the user's configuration.
     // SAFETY: no other threads exist yet.
@@ -718,8 +836,9 @@ fn main() {
         std::env::set_var("CLAUDE_CONFIG_DIR", isolated.path().join("claude"));
         std::env::set_var("CODEX_HOME", isolated.path().join("codex"));
         std::env::set_var("GORO_DATA_DIR", isolated.path().join("goro"));
+        std::env::set_var("GORO_CONFIG_DIR", isolated.path().join("config"));
     }
-    let tests: [(&str, fn()); 13] = [
+    let tests: [(&str, fn()); 15] = [
         (
             "renders_every_file_in_one_stream",
             renders_every_file_in_one_stream,
@@ -760,6 +879,8 @@ fn main() {
             "turns_are_reviewed_on_their_own",
             turns_are_reviewed_on_their_own,
         ),
+        ("split_view_and_image_diffs", split_view_and_image_diffs),
+        ("settings_keybindings_apply", settings_keybindings_apply),
     ];
     for (name, test) in tests {
         test();

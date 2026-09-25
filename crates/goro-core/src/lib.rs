@@ -9,6 +9,7 @@ pub mod ops;
 pub mod patch;
 pub mod repo;
 pub mod review;
+pub mod settings;
 pub mod store;
 pub mod syntax;
 pub mod turns;

@@ -3,13 +3,23 @@
 A native, instant-open review app for agent-written code changes. See [PRD.md](PRD.md)
 and [ARCHITECTURE.md](ARCHITECTURE.md).
 
-Status: M3. `goro [path]` opens a file tree and a syntax-highlighted diff of the
+Status: M4 (v1 feature-complete; release packaging in place). `goro [path]` opens a file tree and a syntax-highlighted diff of the
 working tree (staged, unstaged, untracked) that updates live as an agent works, marks
 what changed since you last looked, and lets you stage, unstage, discard, undo and commit
 in the same window. Without a path it opens the repository an agent (Claude Code, Codex)
 worked in most recently. One instance: later `goro` calls hand off to the open app.
 With agent hooks installed, every agent turn is snapshotted so you can review one turn (or
 a whole session) on its own, and comments go back to the agent as markdown.
+
+## Install
+
+Packages are built for every tagged release (see `.github/workflows/release.yml`):
+macOS (universal `Goro.app`, Homebrew cask), Windows (x64/arm64 zip, Scoop and winget
+manifests), Linux (tarball, `.deb`, AppImage). From source:
+
+```sh
+cargo install --path crates/goro
+```
 
 ## Agents
 
@@ -52,6 +62,30 @@ cargo test --workspace                  # core tests against real temp repos, pl
 | `t` · `<` `>` · `w` | review one agent turn or session · previous/next turn · back to the working tree |
 | `a` · `enter` · `x` | comment on the line or selection · edit the comment under the cursor · delete it |
 | `y` · `cmd-shift-enter` | copy comments as markdown · send them to the agent waiting on `goro --wait` |
+| `v` | unified ↔ side-by-side |
+| `cmd-,` / `ctrl-,` | open the settings file |
+| `cmd-alt-g` / `ctrl-alt-g` | (global, while Goro runs) bring Goro forward |
+
+## Settings
+
+`cmd-,` opens `settings.json` (in `~/Library/Application Support/Goro` on macOS,
+`~/.config/Goro` on Linux, `%APPDATA%\Goro` on Windows; `GORO_CONFIG_DIR` overrides).
+Changes apply as soon as the file is saved; a bad value shows in the status bar and the
+defaults stay in effect.
+
+```json
+{
+  "theme": "system",
+  "font_family": null,
+  "font_size": 12.5,
+  "diff_layout": "unified",
+  "global_hotkey": "cmd+alt+g",
+  "keybindings": { "ctrl-j": "goro::NextHunk", "n": "" }
+}
+```
+
+Keybindings map a keystroke to an action name (`goro::Stage`, `goro::NextFile`, …); an
+empty action removes a default binding. The global hotkey isn't available on Wayland.
 | `c` · `cmd-enter` · `esc` | focus the commit message · commit · back to the diff |
 | `cmd-q` / `ctrl-q` | quit |
 

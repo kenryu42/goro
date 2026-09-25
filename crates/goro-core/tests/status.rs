@@ -291,3 +291,44 @@ fn discover_from_subdirectory_and_reject_non_repos() {
     let outside = tempfile::tempdir().unwrap();
     assert!(Repo::discover(outside.path()).is_err());
 }
+
+#[test]
+fn images_load_both_sides_for_display() {
+    use goro_core::repo::ImageKind;
+    use goro_core::review::{IMAGE_ROWS, Review, Row, load_file};
+    let fx = Fixture::new();
+    fx.write("logo.png", b"\x89PNG\r\n\x1a\nold".as_slice());
+    fx.commit_all("initial");
+    fx.write("logo.png", b"\x89PNG\r\n\x1a\nnew!".as_slice());
+    fx.write("fresh.jpg", b"\xff\xd8\xff\xe0jpeg".as_slice());
+    let repo = fx.repo();
+    let changes = repo.status().unwrap();
+    let thread = repo.thread_local();
+    let mut loader = thread.loader().unwrap();
+    let Loaded::Image { kind, old, new } = loader.load(&changes[0]).unwrap() else {
+        panic!("expected an image for {:?}", changes[0]);
+    };
+    assert_eq!(kind, ImageKind::Png);
+    assert_eq!(old.as_deref(), Some(b"\x89PNG\r\n\x1a\nold".as_slice()));
+    assert_eq!(new.as_deref(), Some(b"\x89PNG\r\n\x1a\nnew!".as_slice()));
+    let Loaded::Image { kind, old, .. } = loader.load(&changes[1]).unwrap() else {
+        panic!("expected an image");
+    };
+    assert_eq!(
+        (kind, old),
+        (ImageKind::Jpeg, None),
+        "new file: nothing before"
+    );
+
+    let mut review = Review::new(fx.root.clone(), changes.clone());
+    for (ix, change) in changes.iter().enumerate() {
+        review.set_loaded(ix, load_file(&thread, change));
+    }
+    review.rebuild_rows();
+    let image_rows = review
+        .rows()
+        .iter()
+        .filter(|r| matches!(r, Row::Image { file: 0, .. }))
+        .count();
+    assert_eq!(image_rows, IMAGE_ROWS);
+}

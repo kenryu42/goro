@@ -27,6 +27,8 @@ use crate::theme::Theme;
 use crate::*;
 use futures::channel::oneshot;
 use goro_core::comments::{Comment, to_markdown};
+use goro_core::repo::ImageKind;
+use goro_core::settings::{DiffLayout, ThemeSetting};
 use goro_core::turns::{self, Session};
 
 pub(crate) const ROW_HEIGHT: f32 = 20.0;
@@ -121,6 +123,9 @@ pub struct GoroView {
     draft: Option<Draft>,
     /// `goro --wait` callers waiting for this review.
     waiters: Vec<oneshot::Sender<String>>,
+    /// A problem with the settings file (refreshed every render).
+    settings_error: Option<String>,
+    image_cache: std::cell::RefCell<std::collections::HashMap<usize, Arc<gpui_kit::Image>>>,
     status: Option<Status>,
     status_generation: u64,
     startup: Startup,
@@ -189,6 +194,8 @@ impl GoroView {
             sessions: Vec::new(),
             draft: None,
             waiters: Vec::new(),
+            image_cache: Default::default(),
+            settings_error: None,
             status: None,
             status_generation: 0,
             startup,
@@ -217,6 +224,7 @@ impl GoroView {
                     review.set_seen(state.seen);
                     review.set_reviewed(state.reviewed);
                     review.set_comments(state.comments);
+                    review.set_layout(crate::app_settings::settings(cx).diff_layout);
                     review.rebuild_rows();
                     self.repo = Some(repo);
                     self.state = State::Ready(Box::new(review));
@@ -293,8 +301,51 @@ impl GoroView {
         cx.notify();
     }
 
-    fn theme(&self, window: &Window) -> Theme {
-        Theme::for_appearance(self.appearance.unwrap_or_else(|| window.appearance()))
+    fn theme(&self, window: &Window, cx: &App) -> Theme {
+        Theme::for_appearance(self.resolved_appearance(window, cx))
+    }
+
+    /// Explicit override (tests), else the settings file, else the OS.
+    fn resolved_appearance(&self, window: &Window, cx: &App) -> WindowAppearance {
+        self.appearance
+            .unwrap_or_else(|| match crate::app_settings::settings(cx).theme {
+                ThemeSetting::Light => WindowAppearance::Light,
+                ThemeSetting::Dark => WindowAppearance::Dark,
+                ThemeSetting::System => window.appearance(),
+            })
+    }
+
+    fn toggle_layout(&mut self, _: &ToggleLayout, _: &mut Window, cx: &mut Context<Self>) {
+        let next = match self.review().map(Review::layout) {
+            Some(DiffLayout::Split) => DiffLayout::Unified,
+            _ => DiffLayout::Split,
+        };
+        self.rebuild_keeping_position(|review| {
+            review.set_layout(next);
+            review.rebuild_rows();
+        });
+        cx.notify();
+    }
+
+    /// Decoded images for image rows, cached by their bytes so scrolling doesn't redo it.
+    pub(crate) fn image_for(&self, bytes: &Arc<[u8]>, kind: ImageKind) -> Arc<gpui_kit::Image> {
+        let key = Arc::as_ptr(bytes) as *const u8 as usize;
+        self.image_cache
+            .borrow_mut()
+            .entry(key)
+            .or_insert_with(|| {
+                let format = match kind {
+                    ImageKind::Png => gpui_kit::ImageFormat::Png,
+                    ImageKind::Jpeg => gpui_kit::ImageFormat::Jpeg,
+                    ImageKind::Gif => gpui_kit::ImageFormat::Gif,
+                    ImageKind::Webp => gpui_kit::ImageFormat::Webp,
+                    ImageKind::Bmp => gpui_kit::ImageFormat::Bmp,
+                    ImageKind::Tiff => gpui_kit::ImageFormat::Tiff,
+                    ImageKind::Ico => gpui_kit::ImageFormat::Ico,
+                };
+                Arc::new(gpui_kit::Image::from_bytes(format, bytes.to_vec()))
+            })
+            .clone()
     }
 
     fn git(&self) -> Option<Git> {
@@ -804,7 +855,7 @@ impl GoroView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<Picker> {
-        let appearance = self.appearance;
+        let appearance = Some(self.resolved_appearance(window, cx));
         let picker = cx.new(|cx| Picker::new(placeholder, items, appearance, cx));
         cx.subscribe_in(
             &picker,
@@ -1431,7 +1482,7 @@ impl GoroView {
                     "tree",
                     count,
                     cx.processor(move |this, range: std::ops::Range<usize>, window, cx| {
-                        let theme = this.theme(window);
+                        let theme = this.theme(window, cx);
                         let Some(review) = this.review() else {
                             return Vec::new();
                         };
@@ -1636,7 +1687,7 @@ impl GoroView {
             "diff",
             review.rows().len(),
             cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
-                let theme = this.theme(window);
+                let theme = this.theme(window, cx);
                 let Some(review) = this.review() else {
                     return Vec::new();
                 };
@@ -1651,7 +1702,7 @@ impl GoroView {
                             is_selected: selected,
                             is_new: this.mode == Mode::WorkingTree && review.is_new(ix),
                         };
-                        diff_rows::render_row(review, ix, flags, &theme, cx)
+                        diff_rows::render_row(this, review, ix, flags, &theme, cx)
                     })
                     .collect()
             }),
@@ -1811,8 +1862,10 @@ impl GoroView {
     }
 
     fn render_status_bar(&self, theme: &Theme) -> impl IntoElement {
+        // (Settings problems are shown until the file is fixed.)
         const MAX_ERROR_LINES: usize = 12;
         // "New since last look" is about the working tree, not a turn's snapshots.
+        let settings_error = self.settings_error.clone();
         let new_count = match self.mode {
             Mode::WorkingTree => self.review().map_or(0, Review::new_count),
             _ => 0,
@@ -1862,6 +1915,13 @@ impl GoroView {
                     .whitespace_nowrap()
                     .overflow_hidden()
                     .child(div().flex_1().child(message))
+                    .when_some(settings_error, |el, err| {
+                        el.child(
+                            div()
+                                .text_color(theme.error)
+                                .child(format!("settings: {err}")),
+                        )
+                    })
                     .when(new_count > 0, |el| {
                         el.child(
                             div()
@@ -1886,7 +1946,14 @@ impl Focusable for GoroView {
 
 impl Render for GoroView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme(window);
+        let theme = self.theme(window, cx);
+        let settings = crate::app_settings::settings(cx);
+        let font_family = settings
+            .font_family
+            .clone()
+            .unwrap_or_else(|| MONO_FONT.to_string());
+        let font_size = settings.font_size;
+        self.settings_error = crate::app_settings::settings_error(cx);
         match &self.state {
             State::Ready(review) => {
                 if let Some(name) = review.root.file_name() {
@@ -1946,14 +2013,15 @@ impl Render for GoroView {
             .on_action(cx.listener(Self::cancel_comment))
             .on_action(cx.listener(Self::copy_comments))
             .on_action(cx.listener(Self::send_review))
+            .on_action(cx.listener(Self::toggle_layout))
             .relative()
             .flex()
             .flex_row()
             .size_full()
             .bg(theme.bg)
             .text_color(theme.fg)
-            .font_family(MONO_FONT)
-            .text_size(px(12.5))
+            .font_family(font_family)
+            .text_size(px(font_size))
             .line_height(px(ROW_HEIGHT))
             .child(self.render_sidebar(&theme, cx))
             .child(
