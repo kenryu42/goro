@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev \
+            libx11-xcb-dev libfontconfig-dev libfreetype-dev libwayland-dev \
+            libvulkan1 mesa-vulkan-drivers fonts-dejavu-core xvfb
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        if: runner.os != 'Linux'
+        run: cargo test --workspace
+      - name: Test (virtual display)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a cargo test --workspace
+
+  bench:
+    name: Performance budgets (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev \
+            libx11-xcb-dev libfontconfig-dev libfreetype-dev libwayland-dev \
+            libvulkan1 mesa-vulkan-drivers fonts-dejavu-core xvfb
+      - run: cargo build --release -p goro
+      - name: Reference repository (golang/go, ~14.5k files, 20-file change)
+        shell: bash
+        run: |
+          git clone -q --depth 1 --branch go1.25.0 https://github.com/golang/go.git "$RUNNER_TEMP/go"
+          python3 scripts/bench/make_changes.py "$RUNNER_TEMP/go" --files 20 --lines 10
+      - name: Startup budget (≤ 300 ms)
+        shell: bash
+        run: |
+          goro=target/release/goro
+          [ "$RUNNER_OS" = Windows ] && goro=target/release/goro.exe
+          run=""
+          [ "$RUNNER_OS" = Linux ] && run="xvfb-run -a"
+          $run python3 scripts/bench/startup.py "$goro" "$RUNNER_TEMP/go" --budget-ms 300
+      - name: Frame budget (p99 ≤ 16 ms, 50k-line changeset)
+        shell: bash
+        run: |
+          run=""
+          [ "$RUNNER_OS" = Linux ] && run="xvfb-run -a"
+          $run cargo bench -p goro-ui --bench scroll

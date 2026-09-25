@@ -8,7 +8,7 @@ expensive to change later.
 | Concern | Choice | Why |
 |---|---|---|
 | Language | Rust (stable, edition 2024) | One codebase for 3 OSes; native speed; same language as the UI layer |
-| UI | GPUI (`gpui-pre =0.3.6`) + gpui-component (`=0.6.6`) | GPU-rendered, platform text systems, proven by Zed on macOS/Windows/Linux; gpui-component supplies tree, virtual lists, inputs, theming |
+| UI | GPUI via `gpui-kit =0.6.6` (pins `gpui-pre =0.3.6`), **without** gpui-component | GPU-rendered, platform text systems, proven by Zed on macOS/Windows/Linux. gpui-component's `init` alone cost ~105 ms of startup (measured in M0), so Goro builds its few widgets (tree, diff list) on plain GPUI |
 | Git reads | `gix` (gitoxide) | Fast status, tree/blob/index access, filter pipeline, pure Rust (clean Windows builds) |
 | Git writes | `git` CLI | Hooks, signing, filters, LFS, `core.*` config behave exactly as the user expects |
 | Diff | `imara-diff` (histogram) | Fast, and the same algorithm family git uses |
@@ -16,14 +16,16 @@ expensive to change later.
 | FS watch | `notify` (FSEvents / ReadDirectoryChangesW / inotify) | Standard cross-platform watcher |
 | IPC | `interprocess` local sockets (Unix socket / named pipe) | Single-instance handoff and hook → app nudges |
 
-**Version pinning.** GPUI changes most weeks. Both GPUI crates are pinned with `=`, and
-upgrades are deliberate, one-commit changes. Reference sources for agents working on the
-UI live next to the code as a pinned git submodule or a documented checkout path, never
-in context by default: Zed at the matching tag, and gpui-component examples.
+**Version pinning.** GPUI changes most weeks. `gpui-kit` is pinned with `=` and pins the
+matching `gpui-pre-*` crates; upgrades are deliberate, one-commit changes. The pinned
+sources in `~/.cargo/registry` (`gpui-pre-0.3.6/examples`, `gpui-kit-0.6.6`) are the
+reference for agents working on the UI. Some useful APIs are `test-support`-only (e.g.
+`UniformListScrollHandle::logical_scroll_top_index`); reimplement them from public state
+rather than enabling test features in release builds.
 
 **License constraint.** Zed's `editor` and `git_ui` crates are GPL-3.0. Goro is
-Apache-2.0 OR MIT, so their code is **not** copied; GPUI and gpui-component are
-Apache-2.0 and fine to depend on.
+Apache-2.0 OR MIT, so their code is **not** copied; GPUI and gpui-kit are Apache-2.0
+and fine to depend on.
 
 ## Workspace layout
 
@@ -65,20 +67,40 @@ Target: first diff painted in ≤ 300 ms. Work runs in parallel wherever it can:
 
 ```
 t0 main()
- ├─ [fg] parse args → IPC probe (instance alive? hand off and exit)
- ├─ [bg] resolve target repo (arg → activity log → agent logs → MRU); ≤ 20 ms, stats + first/last lines only
- ├─ [fg] GPUI app + window creation (GPU device, fonts)
- ├─ [bg] gix status (index vs HEAD, worktree vs index), streamed per file
- ├─ [bg] diff + highlight the FIRST visible file only
- └─ [fg] first paint: tree + first file's hunks
-     then: remaining files diffed/highlighted in viewport-priority order
+ ├─ [fg] parse args → IPC probe (instance alive? hand off and exit)            (M2)
+ ├─ [bg] resolve target repo (arg → activity log → agent logs → MRU)           (M2: arg/cwd only in M0)
+ ├─ [bg] gix status → diff + highlight the first file → `Opened` event
+ ├─ [fg] GPUI platform init (~50 ms on M3 Pro)
+ ├─ [fg] wait for `Opened` (≤ 250 ms), so the first frame already shows the diff
+ ├─ [fg] window creation + first frame drawn (~60 ms)
+ └─ [bg] remaining files diffed/highlighted in parallel (rayon), streamed to the UI in batches
 ```
 
 Rules:
 - Nothing on the UI thread does IO.
-- Only the visible viewport ± one screen is highlighted and shaped; the rest waits.
+- The window waits up to 250 ms for the review so there is no empty-window flash; a
+  slower repository opens immediately and streams in.
+- Rows are virtualized: only visible rows are laid out and shaped. Whole files are
+  parsed for highlighting (correctness needs context), but only spans on displayed
+  lines are kept.
 - Startup timing is instrumented (`GORO_TRACE_STARTUP=1` prints phase timings;
-  `--bench-exit-after-first-paint` for CI).
+  `--bench-exit-after-first-paint` prints `first_paint_ms=` once the first frame
+  containing the diff has been drawn, then quits).
+- macOS pauses drawing for occluded windows. First paint is measured when the frame is
+  drawn, not via a later frame callback, so benchmarks don't hang behind other windows.
+
+M0 measurements (M3 Pro, warm cache, median of 7):
+
+| Repository | Change | First diff drawn |
+|---|---|---|
+| this repo | 17 files | 115 ms |
+| golang/go (14.5k files) | 20 files | 135 ms |
+| linux (89.8k files) | 20 files (+13 case-collision files) | 272 ms |
+| linux | 1,013 files / 50k lines | 285 ms (all files loaded 50 ms later) |
+
+On linux, gix status (~200 ms, vs ~250 ms for `git status`) is the critical path; half
+of it is the untracked-file walk. Streaming status results into the tree is the next
+lever if that budget tightens.
 
 ## Core data model
 
@@ -202,11 +224,18 @@ timeouts, except `commit`, which waits for hooks.
   byte-for-byte (CRLF, filters, and no-trailing-newline cases included).
 - **Agent-log fixtures:** checked-in, trimmed real Claude Code / Codex logs; parsers tested
   against them.
-- **goro-ui:** GPUI `TestAppContext` for view logic (selection, keyboard, row model).
-- **Performance:** startup benchmark via `--bench-exit-after-first-paint` on macOS, Windows,
-  and Linux CI runners against pinned reference repos (git/git, a 10k-file repo,
-  linux); frame-time benchmark on a generated 50k-line changeset. Regressions > 10%
-  fail CI. Absolute budgets are checked on reference hardware before each release.
+- **goro-ui:** `tests/visual.rs` renders the real window through GPUI's
+  `HeadlessAppContext` (real text shaping; real Metal rendering on macOS) against a
+  fixture repository, drives keyboard actions, and asserts view state. It runs without
+  the libtest harness because the macOS platform must be created on the main thread.
+  Set `GORO_SCREENSHOT_DIR` to save PNGs for visual review.
+- **Performance:** `scripts/bench/startup.py` runs `--bench-exit-after-first-paint`
+  against pinned reference repos prepared by `scripts/bench/make_changes.py` (golang/go
+  in CI; linux locally); `cargo bench -p goro-ui --bench scroll` times frames while
+  jumping through a 1,000-file, 50k-changed-line review (M0: p99 ≈ 1 ms CPU per
+  frame). CI fails when a budget is exceeded; tracking >10% regressions against a stored
+  baseline is still to do. Absolute budgets are checked on reference hardware before
+  each release.
 - Logs go to the data dir; tests capture and assert log output and never write outside
   their temp dir.
 

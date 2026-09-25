@@ -1,0 +1,23 @@
+[package]
+name = "goro-ui"
+description = "Goro's GPUI views"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+goro-core.workspace = true
+gpui-kit.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+gpui-kit = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
+
+[[test]]
+name = "visual"
+harness = false
+
+[[bench]]
+name = "scroll"
+harness = false

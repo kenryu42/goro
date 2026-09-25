@@ -1,0 +1,12 @@
+[package]
+name = "goro"
+description = "Instant, native review for agent-written code changes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+goro-core.workspace = true
+goro-ui.workspace = true
+clap.workspace = true
+futures.workspace = true

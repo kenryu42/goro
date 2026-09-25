@@ -139,7 +139,7 @@ Windows 11 and Ubuntu LTS), with a warm OS file cache.
 | Working tree write → UI updated | ≤ 150 ms |
 | `goro hook` wall time (snapshot included), 10k-file repo | ≤ 50 ms |
 | Idle CPU with watch mode on | ~0% |
-| Memory, 10k-line changeset | ≤ 150 MB RSS |
+| Memory footprint (Activity Monitor "Memory"; private working set on Windows), 10k-line changeset | ≤ 150 MB |
 | Installed size | ≤ 40 MB |
 
 ## Distribution
